@@ -1,0 +1,5 @@
+otcharts
+python-telegram-bot
+python-dotenv
+matplotlib
+numpy
