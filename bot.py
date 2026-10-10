@@ -5,7 +5,8 @@ from zoneinfo import ZoneInfo
 from config import (
     BOT_TOKEN, CHANNEL_ID, OTCHARTS_KEY, ADMIN_ID, PAIRS,
     TRADE_DURATION_MINUTES, TREND_EMA_SHORT, TREND_EMA_LONG,
-    TREND_TIMEFRAME, CANDLE_TIMEFRAME, COOLDOWN_AFTER_RESULT_MINUTES
+    TREND_TIMEFRAME, CANDLE_TIMEFRAME,
+    SIGNAL_COOLDOWN_MINUTES, COOLDOWN_AFTER_RESULT_MINUTES
 )
 from analyzer import S3Analyzer
 from charting import generate_candle_chart
@@ -116,8 +117,12 @@ async def send_result_message(pair, result_text):
         text = f"{result_text}\n—\n🌍 DunyaBazaar"
         await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="Markdown")
         await send_admin_feedback(f"Result: {result_text}")
-        next_scan_allowed = datetime.now(LOCAL_TZ) + timedelta(minutes=COOLDOWN_AFTER_RESULT_MINUTES)
-        logger.info(f"Cooldown until {next_scan_allowed.strftime('%H:%M:%S')}")
+
+        # Result-based cooldown: pick whichever is later
+        result_cooldown_end = datetime.now(LOCAL_TZ) + timedelta(minutes=COOLDOWN_AFTER_RESULT_MINUTES)
+        if result_cooldown_end > next_scan_allowed:
+            next_scan_allowed = result_cooldown_end
+            logger.info(f"Result cooldown extended until {next_scan_allowed.strftime('%H:%M:%S')}")
     except Exception as e:
         logger.error(f"Result send error: {e}")
 
@@ -186,7 +191,10 @@ async def run_sniper_loop():
                 }
                 entry_str = best['entry_time'].strftime("%H:%M")
                 await send_signal_with_chart(best['pair'], best['direction'], best['strength'], entry_str)
-                logger.info("M1 signal sent.")
+
+                # ⭐ THE FIX: hard 3-minute cooldown after every signal
+                next_scan_allowed = now + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
+                logger.info(f"M1 signal sent. Next scan allowed at {next_scan_allowed.strftime('%H:%M:%S')}")
             else:
                 logger.info("No M1 setup.")
                 await send_admin_feedback(f"⚪ No setup at {now.strftime('%H:%M')}")
@@ -268,7 +276,7 @@ async def cmd_feed(update, context):
         f"Engine: {status}\n"
         f"Pairs: {len(PAIRS)}\n"
         f"Requests today: `{request_count}` / 7000\n"
-        f"Cooldown until: `{next_scan_allowed.strftime('%H:%M:%S')}`\n\n"
+        f"Next scan allowed: `{next_scan_allowed.strftime('%H:%M:%S')}`\n\n"
     )
     if pending_signals:
         text += "*Pending entry:*\n"
