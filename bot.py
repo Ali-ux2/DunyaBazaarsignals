@@ -23,12 +23,12 @@ analyzer = S3Analyzer()
 LOCAL_TZ = ZoneInfo("Africa/Nairobi")
 IS_BOT_ACTIVE = True
 
-COOLDOWN_AFTER_RESULT_MINUTES = 2   # <--- NEW
+COOLDOWN_AFTER_RESULT_MINUTES = 2
 
 pending_signals = {}
 active_trades = {}
 last_trend_update = datetime.now(LOCAL_TZ) - timedelta(minutes=20)
-next_scan_allowed = datetime.now(LOCAL_TZ)   # <--- NEW
+next_scan_allowed = datetime.now(LOCAL_TZ)
 
 request_count = 0
 request_day = datetime.now(LOCAL_TZ).day
@@ -119,8 +119,6 @@ async def send_result_message(pair, result_text):
         text = f"{result_text}\n—\n🌍 DunyaBazaar"
         await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="Markdown")
         await send_admin_feedback(f"Result: {result_text}")
-
-        # <--- COOLDOWN STARTS HERE
         next_scan_allowed = datetime.now(LOCAL_TZ) + timedelta(minutes=COOLDOWN_AFTER_RESULT_MINUTES)
         logger.info(f"Cooldown until {next_scan_allowed.strftime('%H:%M:%S')}")
     except Exception as e:
@@ -129,7 +127,7 @@ async def send_result_message(pair, result_text):
 
 async def run_sniper_loop():
     global last_trend_update, next_scan_allowed
-    logger.info("Starting DunyaBazaar M5 Engine (2-min cooldown after result)...")
+    logger.info("Starting DunyaBazaar M5 Engine...")
 
     for pair in PAIRS:
         try:
@@ -153,20 +151,16 @@ async def run_sniper_loop():
         seconds = now.second
         minute = now.minute
 
-        # Refresh M15 trend every 15 minutes
         if (now - last_trend_update).total_seconds() > 900 and seconds == 30:
             await update_trends()
 
-        # ============================================================
-        # SCAN at :52 of 4th minute of each 5-min block + after cooldown
-        # ============================================================
         if minute % 5 == 4 and seconds == 52 and now >= next_scan_allowed:
             logger.info(f"M5 Scan at {now.strftime('%H:%M:%S')} | Requests: {request_count}")
             triggered = []
 
             for pair in PAIRS:
-               = try:
-                    bars = otc.candles("quotex", pair, tf300, limit=3)
+                try:
+                    bars = otc.candles("quotex", pair, tf=300, limit=3)
                     count_request()
                     if not bars:
                         continue
@@ -208,14 +202,11 @@ async def run_sniper_loop():
                     best['pair'], best['direction'],
                     best['strength'], entry_str
                 )
-                logger.info(f"M5 signal sent.")
+                logger.info("M5 signal sent.")
             else:
-                logger.info("No M5 setup. Waiting for next 5-min block.")
+                logger.info("No M5 setup.")
                 await send_admin_feedback(f"⚪ No setup at {now.strftime('%H:%M')}")
 
-        # ============================================================
-        # CAPTURE ENTRY + EVALUATE (at :01 seconds)
-        # ============================================================
         elif seconds == 1:
 
             for pair in list(pending_signals.keys()):
@@ -264,7 +255,6 @@ async def run_sniper_loop():
         await asyncio.sleep(1)
 
 
-# ---- Commands ----
 def is_admin(update):
     return str(update.effective_user.id) == str(ADMIN_ID)
 
