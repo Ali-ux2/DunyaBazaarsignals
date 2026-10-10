@@ -24,11 +24,14 @@ BB_PERIOD = 20
 BB_STD = 2.0
 CONFLUENCE_THRESHOLD = 6
 
-# M15 higher-timeframe trend
+# Higher-timeframe trend (M5)
 TREND_EMA_SHORT = 9
 TREND_EMA_LONG = 21
-TREND_TIMEFRAME = 900     # M15
-CANDLE_TIMEFRAME = 300    # M5
+TREND_TIMEFRAME = 300      # M5
+CANDLE_TIMEFRAME = 60      # M1
 
-COOLDOWN_AFTER_RESULT_MINUTES = 2
-TRADE_DURATION_MINUTES = 5
+# Cooldowns for M1
+SIGNAL_COOLDOWN_MINUTES = 3        # <-- Hard 3-min gap between signals
+COOLDOWN_AFTER_RESULT_MINUTES = 2  # Extra cooldown after result (if longer)
+
+TRADE_DURATION_MINUTES = 1
