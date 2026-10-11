@@ -4,10 +4,10 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from config import (
     BOT_TOKEN, CHANNEL_ID, OTCHARTS_KEY, ADMIN_ID, PAIRS,
-    TRADE_DURATION_MINUTES, TREND_EMA_SHORT, TREND_EMA_LONG,
-    TREND_TIMEFRAME, CANDLE_TIMEFRAME,
+    CANDLE_TIMEFRAME, TRADE_DURATION_MINUTES,
     SIGNAL_COOLDOWN_MINUTES, COOLDOWN_AFTER_RESULT_MINUTES,
-    TRADING_HOURS, TRADING_WINDOW_MINUTES
+    TRADING_HOURS, TRADING_WINDOW_MINUTES,
+    CANDLES_FOR_WARMUP, MIN_SCORE
 )
 from analyzer import S3Analyzer
 from charting import generate_candle_chart
@@ -16,7 +16,10 @@ from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TelegramError
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 otc = Client(api_key=OTCHARTS_KEY)
@@ -28,7 +31,6 @@ IS_BOT_ACTIVE = True
 
 pending_signals = {}
 active_trades = {}
-last_trend_update = datetime.now(LOCAL_TZ) - timedelta(minutes=20)
 next_scan_allowed = datetime.now(LOCAL_TZ)
 
 request_count = 0
@@ -51,27 +53,6 @@ async def send_admin_feedback(text):
         logger.error(f"Admin feedback error: {e}")
 
 
-async def update_trends():
-    global last_trend_update
-    logger.info("Updating higher-timeframe trends...")
-    for pair in PAIRS:
-        try:
-            bars = otc.candles("quotex", pair, tf=TREND_TIMEFRAME, limit=50)
-            count_request()
-            if len(bars) >= TREND_EMA_LONG:
-                closes = [b.close for b in bars]
-                ema_s = analyzer._ema(closes, TREND_EMA_SHORT)
-                ema_l = analyzer._ema(closes, TREND_EMA_LONG)
-                if ema_s and ema_l:
-                    trend = "BULLISH" if ema_s > ema_l else "BEARISH"
-                    analyzer.set_m5_trend(pair, trend)
-        except Exception as e:
-            logger.error(f"Trend update failed for {pair}: {e}")
-        await asyncio.sleep(0.3)
-    last_trend_update = datetime.now(LOCAL_TZ)
-    logger.info("Trends updated.")
-
-
 async def send_signal_with_chart(pair, direction, strength, entry_time_str):
     try:
         bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=50)
@@ -79,15 +60,17 @@ async def send_signal_with_chart(pair, direction, strength, entry_time_str):
         if not bars:
             return
         chart_buf = generate_candle_chart(bars, pair)
+
         pair_display = pair.upper().replace('_OTC', '')
         trend = "BULLISH" if direction == "CALL" else "BEARISH"
         arrow = "🟢 CALL ↑" if direction == "CALL" else "🔴 PUT ↓"
         confidence = int(strength)
+
         try:
             payouts = otc.payouts("quotex", [pair])
             count_request()
             payout = payouts.get(pair, 89)
-        except:
+        except Exception:
             payout = 89
 
         text = (
@@ -101,13 +84,19 @@ async def send_signal_with_chart(pair, direction, strength, entry_time_str):
             f"🕒 Entry Time : `{entry_time_str} (+3:00 UTC)`\n"
             f"💰 Payout     : `{payout}%`\n\n"
             f"----------\n\n"
-            f"✨ AI Confidence : `{confidence}%`\n"
-            f"🔒 Filters     : `Weighted Score`\n\n"
+            f"✨ Confidence : `{confidence}%`\n"
+            f"🔒 Confluence : `{MIN_SCORE}/7 votes`\n\n"
             f"----------\n\n"
             f"💬 CONTACT : @DBSdesk"
         )
-        await bot.send_photo(chat_id=CHANNEL_ID, photo=chart_buf, caption=text, parse_mode="Markdown")
-        await send_admin_feedback(f"🟢 Sent {direction} {pair_display} @ {entry_time_str} | Conf: {confidence}%")
+
+        await bot.send_photo(
+            chat_id=CHANNEL_ID, photo=chart_buf,
+            caption=text, parse_mode="Markdown"
+        )
+        await send_admin_feedback(
+            f"🟢 Sent {direction} {pair_display} @ {entry_time_str} | Conf: {confidence}%"
+        )
     except Exception as e:
         logger.error(f"Signal send error for {pair}: {e}")
 
@@ -118,7 +107,10 @@ async def send_result_message(pair, result_text):
         text = f"{result_text}\n—\n🌍 DunyaBazaar"
         await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="Markdown")
         await send_admin_feedback(f"Result: {result_text}")
-        result_cooldown = datetime.now(LOCAL_TZ) + timedelta(minutes=COOLDOWN_AFTER_RESULT_MINUTES)
+
+        result_cooldown = datetime.now(LOCAL_TZ) + timedelta(
+            minutes=COOLDOWN_AFTER_RESULT_MINUTES
+        )
         if result_cooldown > next_scan_allowed:
             next_scan_allowed = result_cooldown
     except Exception as e:
@@ -126,6 +118,8 @@ async def send_result_message(pair, result_text):
 
 
 def in_trading_session(now):
+    if not TRADING_HOURS:
+        return True
     for (sh, sm) in TRADING_HOURS:
         start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
         end = start + timedelta(minutes=TRADING_WINDOW_MINUTES)
@@ -135,21 +129,22 @@ def in_trading_session(now):
 
 
 async def run_sniper_loop():
-    global last_trend_update, next_scan_allowed
-    logger.info("Starting DunyaBazaar M1 Engine (Strengthened)...")
+    global next_scan_allowed
+    logger.info(f"Starting DunyaBazaar M1 engine (NO FILTER, MIN_SCORE={MIN_SCORE})...")
 
+    # --- Warmup: feed historical candles into analyzer ---
     for pair in PAIRS:
         try:
-            bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=80)
+            bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=CANDLES_FOR_WARMUP)
             count_request()
             for bar in bars:
                 analyzer.analyze(pair, bar.close, bar.high, bar.low, bar.open)
+            logger.info(f"Warmed up {pair} with {len(bars)} candles")
         except Exception as e:
-            logger.error(f"M1 warmup failed for {pair}: {e}")
+            logger.error(f"Warmup failed for {pair}: {e}")
         await asyncio.sleep(0.3)
 
-    await update_trends()
-    logger.info("Warmup complete. Entering M1 main loop.")
+    logger.info("Warmup complete. Entering main loop.")
 
     while True:
         if not IS_BOT_ACTIVE:
@@ -159,11 +154,9 @@ async def run_sniper_loop():
         now = datetime.now(LOCAL_TZ)
         seconds = now.second
 
-        if (now - last_trend_update).total_seconds() > 300 and seconds == 30:
-            await update_trends()
-
+        # ---------- SCAN at :52 seconds of every minute ----------
         if in_trading_session(now) and seconds == 52 and now >= next_scan_allowed:
-            logger.info(f"M1 Scan at {now.strftime('%H:%M:%S')} | Requests: {request_count}")
+            logger.info(f"Scan at {now.strftime('%H:%M:%S')} | Requests: {request_count}")
             triggered = []
 
             for pair in PAIRS:
@@ -176,17 +169,18 @@ async def run_sniper_loop():
                     direction, confidence = analyzer.analyze(
                         pair, latest.close, latest.high, latest.low, latest.open
                     )
-
-                    if (direction and pair not in active_trades
+                    if (direction
+                            and pair not in active_trades
                             and pair not in pending_signals
                             and analyzer.last_signal.get(pair) != direction):
                         entry_time = (now + timedelta(seconds=8)).replace(second=0, microsecond=0)
                         expiry_time = entry_time + timedelta(minutes=TRADE_DURATION_MINUTES)
                         triggered.append({
-                            'pair': pair, 'direction': direction,
+                            'pair': pair,
+                            'direction': direction,
                             'strength': confidence,
                             'entry_time': entry_time,
-                            'expiry_time': expiry_time
+                            'expiry_time': expiry_time,
                         })
                 except Exception as e:
                     logger.error(f"Scan error {pair}: {e}")
@@ -199,15 +193,24 @@ async def run_sniper_loop():
                     'expiry_time': best['expiry_time'],
                 }
                 entry_str = best['entry_time'].strftime("%H:%M")
-                await send_signal_with_chart(best['pair'], best['direction'], best['strength'], entry_str)
+                await send_signal_with_chart(
+                    best['pair'], best['direction'], best['strength'], entry_str
+                )
 
+                # Hard 3-minute cooldown after a signal
                 next_scan_allowed = now + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
-                logger.info(f"M1 signal sent. Next scan allowed at {next_scan_allowed.strftime('%H:%M:%S')}")
+                logger.info(
+                    f"Signal sent. Next scan allowed at "
+                    f"{next_scan_allowed.strftime('%H:%M:%S')}"
+                )
             else:
-                logger.info("No M1 setup.")
+                logger.info("No setup this minute.")
                 await send_admin_feedback(f"⚪ No setup at {now.strftime('%H:%M')}")
 
+        # ---------- CAPTURE ENTRY + EVALUATE at :01 seconds ----------
         elif seconds == 1:
+
+            # Capture true entry price at candle open
             for pair in list(pending_signals.keys()):
                 try:
                     bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=1)
@@ -218,10 +221,11 @@ async def run_sniper_loop():
                     pending_signals[pair]['entry_price'] = true_entry
                     active_trades[pair] = pending_signals.pop(pair)
                     analyzer.last_signal[pair] = active_trades[pair]['direction']
-                    logger.info(f"Registered {pair} M1 entry @ {true_entry:.5f}")
+                    logger.info(f"Registered {pair} entry @ {true_entry:.5f}")
                 except Exception as e:
                     logger.error(f"Entry capture error {pair}: {e}")
 
+            # Evaluate expired trades
             for pair in list(active_trades.keys()):
                 try:
                     trade = active_trades[pair]
@@ -233,11 +237,14 @@ async def run_sniper_loop():
                         close_price = bars[-1].close
                         entry_price = trade['entry_price']
                         direction = trade['direction']
+
                         is_win = (direction == 'CALL' and close_price > entry_price) or \
-                                 (direction == 'PUT' and close_price < entry_price)
+                                 (direction == 'PUT'  and close_price < entry_price)
+
                         icon = "✅" if is_win else "❌"
                         word = "WIN" if is_win else "LOSS"
                         pair_display = pair.upper().replace('_OTC', '')
+
                         text = (
                             f"{icon} *{pair_display}*\n"
                             f"Result: *{word}*\n"
@@ -251,6 +258,7 @@ async def run_sniper_loop():
         await asyncio.sleep(1)
 
 
+# ---------------- Commands ----------------
 def is_admin(update):
     return str(update.effective_user.id) == str(ADMIN_ID)
 
@@ -259,28 +267,28 @@ async def cmd_start(update, context):
     if not is_admin(update): return
     global IS_BOT_ACTIVE
     IS_BOT_ACTIVE = True
-    await update.message.reply_text("✅ *M1 Bot ACTIVE.*")
+    await update.message.reply_text("✅ *Bot ACTIVE.* Scanning every minute.")
 
 
 async def cmd_pause(update, context):
     if not is_admin(update): return
     global IS_BOT_ACTIVE
     IS_BOT_ACTIVE = False
-    await update.message.reply_text("⏸️ *M1 Bot PAUSED.*")
+    await update.message.reply_text("⏸️ *Bot PAUSED.*")
 
 
 async def cmd_resume(update, context):
     if not is_admin(update): return
     global IS_BOT_ACTIVE
     IS_BOT_ACTIVE = True
-    await update.message.reply_text("▶️ *M1 Bot RESUMED.*")
+    await update.message.reply_text("▶️ *Bot RESUMED.*")
 
 
 async def cmd_feed(update, context):
     if not is_admin(update): return
     status = "🟢 ACTIVE" if IS_BOT_ACTIVE else "🔴 PAUSED"
     text = (
-        f"📊 *DunyaBazaar M1 Status*\n"
+        f"📊 *DunyaBazaar M1 Status (No Filter)*\n"
         f"Engine: {status}\n"
         f"Pairs: {len(PAIRS)}\n"
         f"Requests today: `{request_count}` / 7000\n"
@@ -291,9 +299,11 @@ async def cmd_feed(update, context):
         for p in pending_signals:
             text += f"• `{p}`\n"
     if active_trades:
-        text += "*Active M1 trades:*\n"
+        text += "*Active trades:*\n"
         for p, t in active_trades.items():
-            text += f"• `{p}` | {t['direction']} | Entry `{t['entry_price']:.5f}` | Exp `{t['expiry_time'].strftime('%H:%M')}`\n"
+            text += (f"• `{p}` | {t['direction']} | "
+                     f"Entry `{t['entry_price']:.5f}` | "
+                     f"Exp `{t['expiry_time'].strftime('%H:%M')}`\n")
     if not pending_signals and not active_trades:
         text += "_No active trades._"
     await update.message.reply_text(text, parse_mode="Markdown")
