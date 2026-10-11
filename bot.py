@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from config import (
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 otc = Client(api_key=OTCHARTS_API_KEY)
 bot = Bot(token=BOT_TOKEN)
 
-# Streaming is strictly single-symbol on Quotex → analyzer tracks just one pair
+# Streaming is single-symbol on Quotex
 analyzer = S3Analyzer(pairs=[ACTIVE_PAIR])
 
 LOCAL_TZ = ZoneInfo("Africa/Nairobi")
@@ -37,10 +38,16 @@ next_scan_allowed = datetime.now(LOCAL_TZ)
 request_count = 0
 request_day = datetime.now(LOCAL_TZ).day
 
-# Live tick from stream — updated in the background worker
+# Live tick from stream
 live_price = {ACTIVE_PAIR: None}
 live_time = {ACTIVE_PAIR: None}
-stream_status = {"connected": False, "last_tick": None, "tick_count": 0}
+stream_status = {
+    "connected": False,
+    "last_tick": None,
+    "tick_count": 0,
+    "error": None,
+    "started_at": None,
+}
 
 
 def count_request(n=1):
@@ -60,37 +67,49 @@ async def send_admin_feedback(text):
 
 
 # ------------------------------------------------------------------
-# Background stream worker — writes into live_price / live_time
+# Background stream worker — auto-retry
 # ------------------------------------------------------------------
 async def stream_worker():
-    """Runs the blocking otc.stream() in a thread, pushing ticks into state."""
-    loop = asyncio.get_event_loop()
+    """Runs the blocking otc.stream() in a thread with auto-retry."""
+    loop = asyncio.get_running_loop()
 
     def _stream():
-        try:
-            logger.info(f"Opening stream for {ACTIVE_PAIR}...")
-            for tick in otc.stream("quotex", [ACTIVE_PAIR]):
-                live_price[ACTIVE_PAIR] = tick.price
-                live_time[ACTIVE_PAIR] = tick.time
-                stream_status["connected"] = True
-                stream_status["last_tick"] = tick.time
-                stream_status["tick_count"] += 1
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            stream_status["connected"] = False
+        while True:
+            try:
+                logger.info(f"Opening stream for {ACTIVE_PAIR}...")
+                stream_status["connected"] = False
+                stream_status["error"] = None
+                stream_status["started_at"] = datetime.now(LOCAL_TZ)
+
+                for tick in otc.stream("quotex", [ACTIVE_PAIR]):
+                    live_price[ACTIVE_PAIR] = tick.price
+                    live_time[ACTIVE_PAIR] = tick.time
+                    stream_status["connected"] = True
+                    stream_status["last_tick"] = tick.time
+                    stream_status["tick_count"] += 1
+
+                logger.warning("Stream closed cleanly. Reconnecting...")
+            except Exception as e:
+                stream_status["connected"] = False
+                stream_status["error"] = f"{type(e).__name__}: {e}"
+                logger.error(f"Stream error: {type(e).__name__}: {e}")
+                logger.info("Retrying stream in 5 seconds...")
+
+            time.sleep(5)
 
     await loop.run_in_executor(None, _stream)
 
 
 # ------------------------------------------------------------------
-# Signal dispatch
+# Signal dispatch — returns True on success, False on failure
 # ------------------------------------------------------------------
 async def send_signal_with_chart(pair, direction, strength, entry_time_str, live):
     try:
         bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=50)
         count_request()
         if not bars:
-            return
+            logger.warning(f"No candles for chart on {pair}")
+            return False
         chart_buf = generate_candle_chart(bars, pair)
 
         pair_display = pair.upper().replace('_OTC', '')
@@ -120,7 +139,7 @@ async def send_signal_with_chart(pair, direction, strength, entry_time_str, live
             f"💹 Live       : `{live_str}`\n\n"
             f"----------\n\n"
             f"✨ Confidence : `{confidence}%`\n"
-            f"🔒 Confluence : `{MIN_SCORE}/7 votes`\n\n"
+            f"🔒 Confluence : `{MIN_SCORE}/6 votes`\n\n"
             f"----------\n\n"
             f"💬 CONTACT : @DBSdesk"
         )
@@ -133,8 +152,10 @@ async def send_signal_with_chart(pair, direction, strength, entry_time_str, live
             f"🟢 Sent {direction} {pair_display} @ {entry_time_str} | "
             f"Conf: {confidence}% | Live: {live_str}"
         )
+        return True
     except Exception as e:
-        logger.error(f"Signal send error: {e}")
+        logger.error(f"Signal send error for {pair}: {e}")
+        return False
 
 
 async def send_result_message(result_text):
@@ -160,7 +181,7 @@ async def run_sniper_loop():
     global next_scan_allowed
     logger.info(f"Starting DunyaBazaar STREAMING engine — pair: {ACTIVE_PAIR}")
 
-    # 1. Warmup — fetch 80 historical M1 candles for the active pair
+    # 1. Warmup
     try:
         bars = otc.candles("quotex", ACTIVE_PAIR, tf=CANDLE_TIMEFRAME,
                            limit=CANDLES_FOR_WARMUP)
@@ -171,7 +192,7 @@ async def run_sniper_loop():
     except Exception as e:
         logger.error(f"Warmup failed: {e}")
 
-    # 2. Start the streaming worker in the background
+    # 2. Start stream worker
     asyncio.create_task(stream_worker())
     logger.info("Stream worker launched. Entering main loop.")
 
@@ -200,7 +221,7 @@ async def run_sniper_loop():
             except Exception as e:
                 logger.error(f"Candle feed error: {e}")
 
-            # Capture true entry price for any pending signal
+            # Capture true entry for pending signals
             for pair in list(pending_signals.keys()):
                 try:
                     bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=1)
@@ -249,16 +270,8 @@ async def run_sniper_loop():
         # SCAN FOR SIGNAL (at :52 of every minute, after cooldown)
         # ----------------------------------------------------------
         elif seconds == 52 and now >= next_scan_allowed:
-            direction, confidence = analyzer.analyze(ACTIVE_PAIR, live_price[ACTIVE_PAIR] or 0)
-            # Note: we don't re-feed the live price — just query the analyzer's
-            # current state built from closed candles.
-
-            # Re-run analyze on the latest closed candle state to check signal
-            # The analyzer already has 100 closed candles in its history, so its
-            # latest score reflects the just-closed candle.
-
-            # Pull latest explanation to check current signal
             expl = analyzer.latest_explanation(ACTIVE_PAIR)
+
             if expl is None:
                 await send_admin_feedback(f"⚪ No setup at {now.strftime('%H:%M')}")
                 logger.info(f"No setup. Stream ticks: {stream_status['tick_count']}")
@@ -266,25 +279,31 @@ async def run_sniper_loop():
                 score = expl["score"]
                 if abs(score) >= MIN_SCORE:
                     direction = "CALL" if score > 0 else "PUT"
-                    confidence_pct = min(abs(score) / 7, 1.0) * 100
+                    confidence_pct = min(abs(score) / 6, 1.0) * 100
 
                     entry_time = (now + timedelta(seconds=8)).replace(second=0, microsecond=0)
                     expiry_time = entry_time + timedelta(minutes=TRADE_DURATION_MINUTES)
-                    pending_signals[ACTIVE_PAIR] = {
-                        'direction': direction,
-                        'expiry_time': expiry_time,
-                    }
                     entry_str = entry_time.strftime("%H:%M")
 
-                    await send_signal_with_chart(
+                    # ⭐ Send signal FIRST — only register the trade if it succeeds
+                    sent_ok = await send_signal_with_chart(
                         ACTIVE_PAIR, direction, confidence_pct, entry_str,
                         live_price[ACTIVE_PAIR]
                     )
-                    next_scan_allowed = now + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
-                    logger.info(
-                        f"Signal sent (score {score:+d}). Next scan at "
-                        f"{next_scan_allowed.strftime('%H:%M:%S')}"
-                    )
+
+                    if sent_ok:
+                        pending_signals[ACTIVE_PAIR] = {
+                            'direction': direction,
+                            'expiry_time': expiry_time,
+                        }
+                        next_scan_allowed = now + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
+                        logger.info(
+                            f"Signal sent (score {score:+d}). Next scan at "
+                            f"{next_scan_allowed.strftime('%H:%M:%S')}"
+                        )
+                    else:
+                        # Signal failed → no trade registered → retry next minute
+                        logger.warning("Signal send failed. Skipping trade registration.")
                 else:
                     await send_admin_feedback(f"⚪ No setup at {now.strftime('%H:%M')}")
                     logger.info(f"No setup (score {score:+d}).")
@@ -301,7 +320,7 @@ async def cmd_start(update, context):
     if not is_admin(update): return
     global IS_BOT_ACTIVE
     IS_BOT_ACTIVE = True
-    await update.message.reply_text(f"✅ *Bot ACTIVE.* Streaming {ACTIVE_PAIR}.")
+    await update.message.reply_text(f"✅ *Bot ACTIVE.* Streaming `{ACTIVE_PAIR}`.")
 
 
 async def cmd_pause(update, context):
@@ -325,6 +344,7 @@ async def cmd_feed(update, context):
     live_str = f"{live:.5f}" if live is not None else "no tick yet"
     last_tick = stream_status["last_tick"]
     last_tick_str = last_tick.strftime("%H:%M:%S") if last_tick else "—"
+    err = stream_status.get("error") or "—"
 
     text = (
         f"📊 *DunyaBazaar STREAMING Status*\n"
@@ -332,6 +352,7 @@ async def cmd_feed(update, context):
         f"Pair: `{ACTIVE_PAIR}`\n"
         f"Live price: `{live_str}`\n"
         f"Stream: {'🟢 CONNECTED' if stream_status['connected'] else '🔴 OFFLINE'}\n"
+        f"Stream err: `{err}`\n"
         f"Ticks received: `{stream_status['tick_count']}`\n"
         f"Last tick: `{last_tick_str}`\n"
         f"Requests today: `{request_count}` / 7000\n"
@@ -355,7 +376,9 @@ async def cmd_feed(update, context):
 async def cmd_testcard(update, context):
     if not is_admin(update): return
     try:
-        await send_signal_with_chart(ACTIVE_PAIR, "PUT", 57, "17:59", live_price.get(ACTIVE_PAIR))
+        await send_signal_with_chart(
+            ACTIVE_PAIR, "PUT", 57, "17:59", live_price.get(ACTIVE_PAIR)
+        )
         await update.message.reply_text("✅ Test card sent.")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
