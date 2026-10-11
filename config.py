@@ -14,7 +14,7 @@ PAIRS = [
     "USDIDR_otc", "USDPHP_otc", "USDEGP_otc", "USDNGN_otc"
 ]
 
-MIN_SCORE = 3
+MIN_SCORE = 4
 USE_M15_GATE = False        # <--- FILTER OFF
 
 EMA_TREND_FAST = 9
