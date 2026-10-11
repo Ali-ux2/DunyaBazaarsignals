@@ -1,247 +1,347 @@
-from collections import deque
-from config import (
-    PAIRS, EMA_SHORT, EMA_MID, EMA_LONG, RSI_PERIOD, ADX_PERIOD, ATR_PERIOD,
-    BB_PERIOD, BB_STD, ADX_MIN, ATR_MIN_PCT, ATR_MAX_PCT, WEIGHTED_SCORE_THRESHOLD
+#!/usr/bin/env python3
+"""
+analyzer.py - 1-minute indicator confluence analyzer + backtester.
+(Merged educational version)
+
+Usage:
+    python analyzer.py candles.csv [--min-score 3] [--payout 0.85]
+                                   [--stake 0.05] [--balance 50]
+    python analyzer.py --demo
+
+CSV columns: time,open,high,low,close  (1-minute candles, oldest first).
+
+DISCLAIMER (READ THIS):
+    This script is for educational and research purposes ONLY.
+    It is NOT financial advice. It is NOT a "sure shot" or guaranteed system.
+
+    Binary options (including Quotex) have a structural disadvantage:
+      - At 85% payout you need ~54.1% win rate just to break even.
+      - At 70% payout you need ~58.8%.
+      - 1-minute charts are extremely noisy; most short-term edges vanish
+        after costs, slippage, and regime changes.
+      - Most retail binary options traders lose money over time.
+      - Martingale / aggressive compounding is one of the fastest ways
+        to blow an account. Do not do it.
+
+    Use only on demo accounts, with strict risk management
+    (1-2% risk per trade, daily loss limits). Past or simulated results
+    do not guarantee future performance. Trade only money you can lose.
+"""
+
+import argparse
+import numpy as np
+import pandas as pd
+
+
+# ----------------------------------------------------------------------------
+# Indicator primitives
+# ----------------------------------------------------------------------------
+
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(s: pd.Series, n: int = 7) -> pd.Series:
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+
+# ----------------------------------------------------------------------------
+# Confluence votes
+# ----------------------------------------------------------------------------
+
+VOTE_COLS = [
+    "ema_trend",   # EMA 9 vs 21 (trend filter)
+    "ema_cross",   # EMA 5/20 fresh crossover (momentum trigger)
+    "rsi",         # RSI(7) extremes (mean reversion)
+    "bollinger",   # Bollinger(20,2) touch
+    "stoch",       # Stochastic(5,3,3) cross in extreme zone
+    "macd",        # MACD(12,26,9) histogram zero-cross
+    "candle",      # Engulfing / pin bar
+]
+
+VOTE_LABELS = {
+    "ema_trend": "EMA 9/21 trend",
+    "ema_cross": "EMA 5/20 fresh crossover",
+    "rsi":       "RSI(7) extreme",
+    "bollinger": "Bollinger(20,2) touch",
+    "stoch":     "Stochastic cross in extreme zone",
+    "macd":      "MACD histogram zero-cross",
+    "candle":    "Candle pattern (engulfing / pin)",
+}
+
+
+def build_votes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Each indicator votes +1 (CALL), -1 (PUT) or 0 (no signal).
+    Returns a DataFrame with one column per indicator plus 'score'.
+    """
+    c, o, h, l = df["close"], df["open"], df["high"], df["low"]
+    v = pd.DataFrame(index=df.index)
+
+    # 1) Trend filter: EMA 9 vs 21
+    v["ema_trend"] = np.where(ema(c, 9) > ema(c, 21), 1, -1)
+
+    # 2) EMA 5/20 fresh crossover (only fires on the cross candle)
+    e5, e20 = ema(c, 5), ema(c, 20)
+    cross_up = (e5 > e20) & (e5.shift() <= e20.shift())
+    cross_dn = (e5 < e20) & (e5.shift() >= e20.shift())
+    v["ema_cross"] = np.select([cross_up, cross_dn], [1, -1], 0)
+
+    # 3) RSI(7) extremes (mean reversion)
+    r = rsi(c, 7)
+    v["rsi"] = np.select([r < 25, r > 75], [1, -1], 0)
+
+    # 4) Bollinger(20,2): close outside band
+    ma, sd = c.rolling(20).mean(), c.rolling(20).std()
+    v["bollinger"] = np.select([c < ma - 2 * sd, c > ma + 2 * sd], [1, -1], 0)
+
+    # 5) Stochastic(5,3,3) cross in extreme zones
+    hh, ll = h.rolling(5).max(), l.rolling(5).min()
+    k = (100 * (c - ll) / (hh - ll).replace(0, np.nan)).rolling(3).mean()
+    d = k.rolling(3).mean()
+    stoch_up = (k > d) & (k.shift() <= d.shift())
+    stoch_dn = (k < d) & (k.shift() >= d.shift())
+    v["stoch"] = np.select([stoch_up & (k < 30), stoch_dn & (k > 70)], [1, -1], 0)
+
+    # 6) MACD(12,26,9) histogram zero-cross
+    macd_line = ema(c, 12) - ema(c, 26)
+    hist = macd_line - ema(macd_line, 9)
+    v["macd"] = np.select(
+        [(hist > 0) & (hist.shift() <= 0), (hist < 0) & (hist.shift() >= 0)],
+        [1, -1], 0)
+
+    # 7) Candle patterns: engulfing + pin bars
+    body = (c - o).abs()
+    up_w = h - np.maximum(c, o)
+    lo_w = np.minimum(c, o) - l
+    bull_eng = (c.shift() < o.shift()) & (c > o) & (c > o.shift()) & (o < c.shift())
+    bear_eng = (c.shift() > o.shift()) & (c < o) & (c < o.shift()) & (o > c.shift())
+    hammer = (lo_w > 2 * body) & (up_w < body)
+    star = (up_w > 2 * body) & (lo_w < body)
+    v["candle"] = np.select([bull_eng | hammer, bear_eng | star], [1, -1], 0)
+
+    v["score"] = v[VOTE_COLS].sum(axis=1)
+    return v
+
+
+# ----------------------------------------------------------------------------
+# Backtester
+# ----------------------------------------------------------------------------
+
+def backtest(df, score, min_score, payout, stake_pct, balance):
+    """1-minute expiry = next candle close. Ties (equal close) are skipped."""
+    sig = np.where(score >= min_score, 1,
+                   np.where(score <= -min_score, -1, 0))
+    nxt = df["close"].shift(-1)
+    up, dn = nxt > df["close"], nxt < df["close"]
+    win = ((sig == 1) & up) | ((sig == -1) & dn)
+    tie = (sig != 0) & (nxt == df["close"])
+    trade = (sig != 0) & nxt.notna()
+
+    wins = int((win & trade).sum())
+    losses = int((trade & ~win & ~tie).sum())
+    n = wins + losses
+    wr = wins / n if n else 0.0
+    breakeven = 1 / (1 + payout)
+
+    bal, peak, max_dd = balance, balance, 0.0
+    for w, t, tr in zip(win.values, tie.values, trade.values):
+        if not tr or t:
+            continue
+        stake = bal * stake_pct
+        bal += stake * payout if w else -stake
+        peak = max(peak, bal)
+        max_dd = max(max_dd, (peak - bal) / peak)
+
+    return dict(trades=n, wins=wins, win_rate=wr, breakeven=breakeven,
+                final_balance=bal, max_drawdown=max_dd)
+
+
+# ----------------------------------------------------------------------------
+# Latest-candle explanation
+# ----------------------------------------------------------------------------
+
+def explain_latest(votes: pd.DataFrame, min_score: int) -> dict:
+    """Turn the latest row of votes into a human-readable signal."""
+    last = votes.iloc[-1]
+    score = int(last["score"])
+
+    call_reasons, put_reasons = [], []
+    for col in VOTE_COLS:
+        val = int(last[col])
+        if val > 0:
+            call_reasons.append(VOTE_LABELS[col])
+        elif val < 0:
+            put_reasons.append(VOTE_LABELS[col])
+
+    if score >= min_score:
+        signal = "CALL (UP)"
+    elif score <= -min_score:
+        signal = "PUT (DOWN)"
+    else:
+        signal = "NO TRADE"
+
+    confidence = min(abs(score) / len(VOTE_COLS), 1.0)
+
+    return {
+        "signal": signal,
+        "score": score,
+        "confidence": round(confidence, 2),
+        "call_reasons": call_reasons,
+        "put_reasons": put_reasons,
+        "votes": {col: int(last[col]) for col in VOTE_COLS},
+    }
+
+
+def format_status(latest: dict, min_score: int) -> str:
+    """
+    Always return a human-readable status line.
+    Never silent: even when there is no trade, say so and why.
+    """
+    s = latest["score"]
+    if latest["signal"] != "NO TRADE":
+        return (f"{latest['signal']}  (confidence {latest['confidence']:.0%})")
+
+    # No trade -> explain why
+    if s == 0:
+        return "NO SETUP — indicators are balanced / flat"
+    if abs(s) == 1:
+        return f"NO SETUP — only 1 vote (need {min_score})"
+    if abs(s) == 2:
+        return f"NO SETUP — only 2 votes (need {min_score})"
+    # abs(s) high but thresholds not aligned (rare with symmetric rule)
+    return f"NO SETUP — conflicting votes (score {s:+d}, need ±{min_score})"
+
+
+def format_warm(latest: dict, min_score: int) -> str:
+    """Optional hint: are we one vote away from a setup?"""
+    s = latest["score"]
+    if latest["signal"] != "NO TRADE":
+        return ""
+    if abs(s) == min_score - 1 and min_score >= 2:
+        return f" (close — 1 more vote gives {min_score})"
+    return ""
+
+
+# ----------------------------------------------------------------------------
+# Demo data
+# ----------------------------------------------------------------------------
+
+def make_demo_df(n: int = 300, seed: int = 42) -> pd.DataFrame:
+    """Synthetic OHLC just so the script runs without a CSV."""
+    rng = np.random.default_rng(seed)
+    ret = rng.normal(0, 0.0006, n) + 0.00002
+    close = 1.1000 * np.exp(np.cumsum(ret))
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    span = np.abs(rng.normal(0, 0.0004, n))
+    high = np.maximum(open_, close) + span
+    low = np.minimum(open_, close) - span
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close})
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+DISCLAIMER = (
+    "=" * 66 + "\n"
+    "Educational / research use only. NOT financial advice.\n"
+    "Binary options: ~54% wins needed at 85% payout just to break even;\n"
+    "~59% at 70% payout. Most retail traders lose. No indicator combo is a\n"
+    "'sure shot.' Backtests do not guarantee future results. Demo only.\n"
+    + "=" * 66
 )
 
 
-class S3Analyzer:
-    def __init__(self):
-        self.price_history = {p: deque(maxlen=120) for p in PAIRS}
-        self.high_history  = {p: deque(maxlen=120) for p in PAIRS}
-        self.low_history   = {p: deque(maxlen=120) for p in PAIRS}
-        self.open_history  = {p: deque(maxlen=120) for p in PAIRS}
-        self.m5_trend = {p: None for p in PAIRS}
-        self.last_signal = {p: None for p in PAIRS}
+def main():
+    ap = argparse.ArgumentParser(
+        description="1-minute confluence analyzer + backtester (educational).")
+    ap.add_argument("csv", nargs="?", help="OHLC CSV (time,open,high,low,close)")
+    ap.add_argument("--demo", action="store_true",
+                    help="Run on synthetic data (no CSV required)")
+    ap.add_argument("--min-score", type=int, default=3)
+    ap.add_argument("--payout", type=float, default=0.85)
+    ap.add_argument("--stake", type=float, default=0.05)
+    ap.add_argument("--balance", type=float, default=50)
+    ap.add_argument("--brief", action="store_true",
+                    help="Print only the one-line status (bot-friendly)")
+    a = ap.parse_args()
 
-    def set_m5_trend(self, pair, trend):
-        self.m5_trend[pair] = trend
+    # --- Load data --------------------------------------------------------
+    if a.demo or not a.csv:
+        if not a.csv and not a.demo:
+            if not a.brief:
+                print("[info] No CSV given; falling back to --demo data.\n")
+        df = make_demo_df()
+    else:
+        df = pd.read_csv(a.csv)
+        df.columns = [x.lower().strip() for x in df.columns]
 
-    # ---------- Math helpers ----------
-    def _ema(self, prices, period):
-        if len(prices) < period:
-            return None
-        k = 2 / (period + 1)
-        ema = sum(prices[:period]) / period
-        for p in prices[period:]:
-            ema = (p - ema) * k + ema
-        return ema
+    required = {"open", "high", "low", "close"}
+    if not required.issubset(df.columns):
+        raise SystemExit(f"CSV must contain columns {sorted(required)}; "
+                         f"found {list(df.columns)}")
+    if len(df) < 50:
+        raise SystemExit(f"Need at least ~50 candles for stable indicators "
+                         f"(got {len(df)}).")
 
-    def _rsi(self, prices, period=14):
-        if len(prices) < period + 1:
-            return None
-        gains, losses = [], []
-        for i in range(1, len(prices)):
-            diff = prices[i] - prices[i - 1]
-            gains.append(max(diff, 0))
-            losses.append(max(-diff, 0))
-        avg_gain = sum(gains[-period:]) / period
-        avg_loss = sum(losses[-period:]) / period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
+    votes = build_votes(df)
+    latest = explain_latest(votes, a.min_score)
 
-    def _atr(self, highs, lows, closes, period=14):
-        if len(closes) < period + 1:
-            return None
-        trs = []
-        for i in range(1, len(closes)):
-            tr = max(highs[i] - lows[i],
-                     abs(highs[i] - closes[i - 1]),
-                     abs(lows[i] - closes[i - 1]))
-            trs.append(tr)
-        return sum(trs[-period:]) / period
+    # --- Brief / bot-friendly output --------------------------------------
+    if a.brief:
+        s = latest["score"]
+        if latest["signal"] == "NO TRADE":
+            line = (f"No setup | score {s:+d} (need ±{a.min_score}) "
+                    f"| votes: {latest['votes']}")
+        else:
+            line = (f"{latest['signal']} | score {s:+d} "
+                    f"| confidence {latest['confidence']:.0%} "
+                    f"| votes: {latest['votes']}")
+        print(line)
+        return
 
-    def _bollinger(self, prices, period=20, std_mult=2.0):
-        if len(prices) < period:
-            return None, None, None
-        window = prices[-period:]
-        sma = sum(window) / period
-        variance = sum((p - sma) ** 2 for p in window) / period
-        std = variance ** 0.5
-        return sma - std_mult * std, sma, sma + std_mult * std
+    # --- Full output ------------------------------------------------------
+    print(DISCLAIMER + "\n")
 
-    def _adx(self, highs, lows, closes, period=14):
-        if len(closes) < period + 1:
-            return None
-        tr_list, plus_dm, minus_dm = [], [], []
-        for i in range(1, len(closes)):
-            hd = highs[i] - highs[i - 1]
-            ld = lows[i - 1] - lows[i]
-            plus_dm.append(hd if (hd > ld and hd > 0) else 0)
-            minus_dm.append(ld if (ld > hd and ld > 0) else 0)
-            tr = max(highs[i] - lows[i],
-                     abs(highs[i] - closes[i - 1]),
-                     abs(lows[i] - closes[i - 1]))
-            tr_list.append(tr)
-        atr = sum(tr_list[-period:]) / period
-        if atr == 0:
-            return 0
-        plus_di = 100 * (sum(plus_dm[-period:]) / period) / atr
-        minus_di = 100 * (sum(minus_dm[-period:]) / period) / atr
-        di_sum = plus_di + minus_di
-        if di_sum == 0:
-            return 0
-        return 100 * abs(plus_di - minus_di) / di_sum
+    print(f"Candles: {len(df)}  |  payout {a.payout:.0%}  |  "
+          f"break-even win rate {1 / (1 + a.payout):.1%}\n")
 
-    def _candle_pattern(self, opens, highs, lows, closes):
-        if len(closes) < 2:
-            return None
-        o1, h1, l1, c1 = opens[-2], highs[-2], lows[-2], closes[-2]
-        o2, h2, l2, c2 = opens[-1], highs[-1], lows[-1], closes[-1]
+    print("Backtest by confluence threshold:")
+    print(f"{'min':>3} {'trades':>7} {'win%':>7} {'end bal':>10} {'maxDD':>7}")
+    for ms in range(2, min(7, len(VOTE_COLS) + 1)):
+        r = backtest(df, votes["score"], ms, a.payout, a.stake, a.balance)
+        print(f"{ms:>3} {r['trades']:>7} {r['win_rate']:>7.1%} "
+              f"{r['final_balance']:>10.2f} {r['max_drawdown']:>7.1%}")
+    print("\nIf win% sits below break-even, the strategy loses money.")
+    print("Backtests on past data do not guarantee future results.\n")
 
-        body2 = abs(c2 - o2)
-        range2 = h2 - l2 if h2 > l2 else 0.00001
+    # --- Latest candle: ALWAYS print a status ----------------------------
+    s = latest["score"]
+    status = format_status(latest, a.min_score)
+    warm = format_warm(latest, a.min_score)
 
-        # Bullish engulfing
-        if c2 > o2 and c1 < o1 and c2 > o1 and o2 < c1:
-            return "BULL"
-        # Bearish engulfing
-        if c2 < o2 and c1 > o1 and c2 < o1 and o2 > c1:
-            return "BEAR"
-        # Hammer
-        lower_wick = min(o2, c2) - l2
-        upper_wick = h2 - max(o2, c2)
-        if body2 > 0 and lower_wick > 2 * body2 and upper_wick < body2:
-            return "BULL"
-        # Shooting star
-        if body2 > 0 and upper_wick > 2 * body2 and lower_wick < body2:
-            return "BEAR"
-        return None
+    print("Latest candle votes:",
+          {k: v for k, v in latest["votes"].items()})
+    print(f"Score {s:+d}  ->  {status}{warm}")
 
-    def _rsi_divergence(self, prices, rsi_lookback=5):
-        if len(prices) < RSI_PERIOD + rsi_lookback + 1:
-            return None
-        rsi_series = []
-        for i in range(rsi_lookback + 1):
-            subset = prices[:-(rsi_lookback - i)] if i < rsi_lookback else prices
-            r = self._rsi(subset, RSI_PERIOD)
-            if r is not None:
-                rsi_series.append(r)
-        if len(rsi_series) < 2:
-            return None
+    if latest["call_reasons"]:
+        print("  CALL votes:")
+        for r in latest["call_reasons"]:
+            print(f"    • {r}")
+    if latest["put_reasons"]:
+        print("  PUT votes:")
+        for r in latest["put_reasons"]:
+            print(f"    • {r}")
 
-        price_now = prices[-1]
-        price_prev = prices[-(rsi_lookback + 1)]
-        rsi_now = rsi_series[-1]
-        rsi_prev = rsi_series[0]
+    print(f"  Threshold: |score| >= {a.min_score} required.")
+    if latest["signal"] == "NO TRADE":
+        print("  No trade is intentional and often better than forcing an entry.")
+    print("\nReminder: educational only. Demo account. Strict risk management.")
 
-        if price_now < price_prev and rsi_now > rsi_prev:
-            return "BULL"
-        if price_now > price_prev and rsi_now < rsi_prev:
-            return "BEAR"
-        return None
 
-    # ---------- Main analyze ----------
-    def analyze(self, pair, price, high=None, low=None, open_=None):
-        prices = list(self.price_history[pair])
-        highs  = list(self.high_history[pair])
-        lows   = list(self.low_history[pair])
-        opens  = list(self.open_history[pair])
-
-        prices.append(price)
-        highs.append(high if high else price)
-        lows.append(low if low else price)
-        opens.append(open_ if open_ else (prices[-2] if len(prices) > 1 else price))
-
-        self.price_history[pair].append(price)
-        self.high_history[pair].append(high if high else price)
-        self.low_history[pair].append(low if low else price)
-        self.open_history[pair].append(opens[-1])
-
-        if len(prices) < 60:
-            return None, 0.0
-
-        # ---------- HARD FILTERS ----------
-        atr = self._atr(highs, lows, prices, ATR_PERIOD)
-        if atr is None or price <= 0:
-            return None, 0.0
-        atr_pct = atr / price
-        if atr_pct < ATR_MIN_PCT:
-            return None, 0.0
-        if atr_pct > ATR_MAX_PCT:
-            return None, 0.0
-
-        adx = self._adx(highs, lows, prices, ADX_PERIOD)
-        if adx is None or adx < ADX_MIN:
-            return None, 0.0
-
-        # ---------- WEIGHTED VOTING ----------
-        call_score = 0.0
-        put_score = 0.0
-
-        ema9 = self._ema(prices, EMA_SHORT)
-        ema21 = self._ema(prices, EMA_MID)
-        if ema9 and ema21:
-            if ema9 > ema21:
-                call_score += 1.5
-            else:
-                put_score += 1.5
-
-        ema50 = self._ema(prices, EMA_LONG)
-        if ema50:
-            if price > ema50:
-                call_score += 1.0
-            else:
-                put_score += 1.0
-
-        rsi = self._rsi(prices, RSI_PERIOD)
-        if rsi is not None:
-            if 55 <= rsi < 72:
-                call_score += 1.5
-            elif 28 < rsi <= 45:
-                put_score += 1.5
-
-        ema12 = self._ema(prices, 12)
-        ema26 = self._ema(prices, 26)
-        if ema12 and ema26:
-            prev = prices[:-3]
-            e12p = self._ema(prev, 12)
-            e26p = self._ema(prev, 26)
-            if e12p and e26p:
-                macd_now = ema12 - ema26
-                macd_prev = e12p - e26p
-                if macd_now > macd_prev:
-                    call_score += 1.0
-                else:
-                    put_score += 1.0
-
-        bb_low, bb_mid, bb_high = self._bollinger(prices, BB_PERIOD, BB_STD)
-        if bb_low is not None and bb_high > bb_low:
-            pos = (price - bb_low) / (bb_high - bb_low)
-            if 0.5 < pos < 0.85:
-                call_score += 1.0
-            elif 0.15 < pos < 0.5:
-                put_score += 1.0
-
-        pattern = self._candle_pattern(opens, highs, lows, prices)
-        if pattern == "BULL":
-            call_score += 1.5
-        elif pattern == "BEAR":
-            put_score += 1.5
-
-        divergence = self._rsi_divergence(prices)
-        if divergence == "BULL":
-            call_score += 1.0
-        elif divergence == "BEAR":
-            put_score += 1.0
-
-        m15 = self.m5_trend.get(pair)
-        if m15 == "BULLISH":
-            call_score += 1.5
-        elif m15 == "BEARISH":
-            put_score += 1.5
-
-        max_score = max(call_score, put_score)
-        if max_score < WEIGHTED_SCORE_THRESHOLD:
-            return None, 0.0
-
-        if call_score > put_score:
-            confidence = min(100.0, (call_score / 10.0) * 100)
-            return "CALL", confidence
-        elif put_score > call_score:
-            confidence = min(100.0, (put_score / 10.0) * 100)
-            return "PUT", confidence
-
-        return None, 0.0
+if __name__ == "__main__":
+    main()
