@@ -6,7 +6,8 @@ from config import (
     BOT_TOKEN, CHANNEL_ID, OTCHARTS_KEY, ADMIN_ID, PAIRS,
     TRADE_DURATION_MINUTES, TREND_EMA_SHORT, TREND_EMA_LONG,
     TREND_TIMEFRAME, CANDLE_TIMEFRAME,
-    SIGNAL_COOLDOWN_MINUTES, COOLDOWN_AFTER_RESULT_MINUTES
+    SIGNAL_COOLDOWN_MINUTES, COOLDOWN_AFTER_RESULT_MINUTES,
+    TRADING_HOURS, TRADING_WINDOW_MINUTES
 )
 from analyzer import S3Analyzer
 from charting import generate_candle_chart
@@ -52,7 +53,7 @@ async def send_admin_feedback(text):
 
 async def update_trends():
     global last_trend_update
-    logger.info("Updating trends...")
+    logger.info("Updating higher-timeframe trends...")
     for pair in PAIRS:
         try:
             bars = otc.candles("quotex", pair, tf=TREND_TIMEFRAME, limit=50)
@@ -101,7 +102,7 @@ async def send_signal_with_chart(pair, direction, strength, entry_time_str):
             f"💰 Payout     : `{payout}%`\n\n"
             f"----------\n\n"
             f"✨ AI Confidence : `{confidence}%`\n"
-            f"🔒 Filters     : `6/7 Aligned`\n\n"
+            f"🔒 Filters     : `Weighted Score`\n\n"
             f"----------\n\n"
             f"💬 CONTACT : @DBSdesk"
         )
@@ -117,26 +118,32 @@ async def send_result_message(pair, result_text):
         text = f"{result_text}\n—\n🌍 DunyaBazaar"
         await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="Markdown")
         await send_admin_feedback(f"Result: {result_text}")
-
-        # Result-based cooldown: pick whichever is later
-        result_cooldown_end = datetime.now(LOCAL_TZ) + timedelta(minutes=COOLDOWN_AFTER_RESULT_MINUTES)
-        if result_cooldown_end > next_scan_allowed:
-            next_scan_allowed = result_cooldown_end
-            logger.info(f"Result cooldown extended until {next_scan_allowed.strftime('%H:%M:%S')}")
+        result_cooldown = datetime.now(LOCAL_TZ) + timedelta(minutes=COOLDOWN_AFTER_RESULT_MINUTES)
+        if result_cooldown > next_scan_allowed:
+            next_scan_allowed = result_cooldown
     except Exception as e:
         logger.error(f"Result send error: {e}")
 
 
+def in_trading_session(now):
+    for (sh, sm) in TRADING_HOURS:
+        start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end = start + timedelta(minutes=TRADING_WINDOW_MINUTES)
+        if start <= now <= end:
+            return True
+    return False
+
+
 async def run_sniper_loop():
     global last_trend_update, next_scan_allowed
-    logger.info("Starting DunyaBazaar M1 Engine...")
+    logger.info("Starting DunyaBazaar M1 Engine (Strengthened)...")
 
     for pair in PAIRS:
         try:
             bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=80)
             count_request()
             for bar in bars:
-                analyzer.analyze(pair, bar.close, bar.high, bar.low)
+                analyzer.analyze(pair, bar.close, bar.high, bar.low, bar.open)
         except Exception as e:
             logger.error(f"M1 warmup failed for {pair}: {e}")
         await asyncio.sleep(0.3)
@@ -155,7 +162,7 @@ async def run_sniper_loop():
         if (now - last_trend_update).total_seconds() > 300 and seconds == 30:
             await update_trends()
 
-        if seconds == 52 and now >= next_scan_allowed:
+        if in_trading_session(now) and seconds == 52 and now >= next_scan_allowed:
             logger.info(f"M1 Scan at {now.strftime('%H:%M:%S')} | Requests: {request_count}")
             triggered = []
 
@@ -166,7 +173,9 @@ async def run_sniper_loop():
                     if not bars:
                         continue
                     latest = bars[-1]
-                    direction, confidence = analyzer.analyze(pair, latest.close, latest.high, latest.low)
+                    direction, confidence = analyzer.analyze(
+                        pair, latest.close, latest.high, latest.low, latest.open
+                    )
 
                     if (direction and pair not in active_trades
                             and pair not in pending_signals
@@ -192,7 +201,6 @@ async def run_sniper_loop():
                 entry_str = best['entry_time'].strftime("%H:%M")
                 await send_signal_with_chart(best['pair'], best['direction'], best['strength'], entry_str)
 
-                # ⭐ THE FIX: hard 3-minute cooldown after every signal
                 next_scan_allowed = now + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
                 logger.info(f"M1 signal sent. Next scan allowed at {next_scan_allowed.strftime('%H:%M:%S')}")
             else:

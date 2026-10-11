@@ -19,19 +19,29 @@ EMA_MID = 21
 EMA_LONG = 50
 RSI_PERIOD = 14
 ADX_PERIOD = 14
-ADX_MIN = 25
+ATR_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
-CONFLUENCE_THRESHOLD = 6
 
-# Higher-timeframe trend (M5)
+ADX_MIN = 22
+ATR_MIN_PCT = 0.0003
+ATR_MAX_PCT = 0.005
+WEIGHTED_SCORE_THRESHOLD = 5.0
+
+TRADING_HOURS = [
+    (5, 30),
+    (10, 0),
+    (16, 30),
+    (20, 0),
+]
+TRADING_WINDOW_MINUTES = 90
+
+# M1 uses M5 as its higher-timeframe trend
 TREND_EMA_SHORT = 9
 TREND_EMA_LONG = 21
 TREND_TIMEFRAME = 300      # M5
 CANDLE_TIMEFRAME = 60      # M1
 
-# Cooldowns for M1
-SIGNAL_COOLDOWN_MINUTES = 3        # <-- Hard 3-min gap between signals
-COOLDOWN_AFTER_RESULT_MINUTES = 2  # Extra cooldown after result (if longer)
-
+SIGNAL_COOLDOWN_MINUTES = 3
+COOLDOWN_AFTER_RESULT_MINUTES = 2
 TRADE_DURATION_MINUTES = 1
