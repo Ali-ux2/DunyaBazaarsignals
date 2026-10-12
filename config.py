@@ -18,8 +18,8 @@ PAIRS = [
 
 # --- Vote-based confluence ---
 # Note: with always-fire votes, scores are always EVEN.
-# MIN_SCORE = 5 → only 6/6 votes fire.
-MIN_SCORE = 5
+# MIN_SCORE = 6 → only 6/6 votes fire.
+MIN_SCORE = 6
 
 # Vote periods
 EMA_TREND_FAST = 9

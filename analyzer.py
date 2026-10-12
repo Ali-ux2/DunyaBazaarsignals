@@ -1,6 +1,7 @@
 """
-Vote-based confluence analyzer — always-fire 6 votes, multi-pair.
-Score = sum of votes. Signal when |score| >= MIN_SCORE.
+Vote-based confluence analyzer — M1 OTC, non-MTG compounding.
+Votes can be +1, -1, or 0. Signal only when |score| >= MIN_SCORE.
+With MIN_SCORE = 6, every vote must agree and pass quality checks.
 """
 
 import numpy as np
@@ -19,12 +20,12 @@ from config import (
 VOTE_COLS = ["ema_trend", "ema_short", "macd", "rsi", "stoch", "candle"]
 
 VOTE_LABELS = {
-    "ema_trend": "EMA 9/21 trend",
+    "ema_trend": "EMA 9/21 trend + slope",
     "ema_short": "EMA 5/20 short trend",
     "macd":      "MACD histogram",
-    "rsi":       "RSI vs 50",
-    "stoch":     "Stoch K vs D",
-    "candle":    "Last candle direction",
+    "rsi":       "RSI in clean zone",
+    "stoch":     "Stoch K vs D, not extreme",
+    "candle":    "Clean body candle",
 }
 
 TOTAL_VOTES = 6
@@ -60,8 +61,13 @@ class S3Analyzer:
             "close": list(self.closes[pair]),
         })
         votes = self._build_votes(df)
-        score = int(votes.iloc[-1]["score"])
+        last = votes.iloc[-1]
 
+        # Chop through EMA 21 — skip
+        if bool(last.get("chop", False)):
+            return None, 0.0
+
+        score = int(last["score"])
         if abs(score) < MIN_SCORE:
             return None, 0.0
 
@@ -81,6 +87,7 @@ class S3Analyzer:
         v = self._build_votes(df).iloc[-1]
         return {
             "score": int(v["score"]),
+            "chop": bool(v.get("chop", False)),
             "call_reasons": [VOTE_LABELS[c] for c in VOTE_COLS if int(v[c]) > 0],
             "put_reasons":  [VOTE_LABELS[c] for c in VOTE_COLS if int(v[c]) < 0],
         }
@@ -100,27 +107,72 @@ class S3Analyzer:
         c, o, h, l = df["close"], df["open"], df["high"], df["low"]
         v = pd.DataFrame(index=df.index)
 
-        v["ema_trend"] = np.where(
-            self._ema(c, EMA_TREND_FAST) > self._ema(c, EMA_TREND_SLOW), 1, -1
-        )
+        ema_fast = self._ema(c, EMA_TREND_FAST)
+        ema_slow = self._ema(c, EMA_TREND_SLOW)
+        ema_short_f = self._ema(c, EMA_SHORT_FAST)
+        ema_short_s = self._ema(c, EMA_SHORT_SLOW)
+
+        # EMA trend: must be above/below AND sloping with the trade
+        slope = ema_fast.diff()
+        call_trend = (ema_fast > ema_slow) & (slope > 0)
+        put_trend  = (ema_fast < ema_slow) & (slope < 0)
+        v["ema_trend"] = np.where(call_trend, 1, np.where(put_trend, -1, 0))
+
+        # Short EMA
         v["ema_short"] = np.where(
-            self._ema(c, EMA_SHORT_FAST) > self._ema(c, EMA_SHORT_SLOW), 1, -1
+            ema_short_f > ema_short_s, 1,
+            np.where(ema_short_f < ema_short_s, -1, 0)
         )
 
+        # MACD histogram
         macd_line = self._ema(c, MACD_FAST) - self._ema(c, MACD_SLOW)
         hist = macd_line - self._ema(macd_line, MACD_SIGNAL)
-        v["macd"] = np.where(hist > 0, 1, -1)
+        v["macd"] = np.where(hist > 0, 1, np.where(hist < 0, -1, 0))
 
+        # RSI: only the clean zone. 55-70 CALL, 30-45 PUT. Else 0.
         r = self._rsi(c, RSI_PERIOD)
-        v["rsi"] = np.where(r > 50, 1, -1)
+        v["rsi"] = np.where(
+            (r >= 55) & (r <= 70), 1,
+            np.where((r >= 30) & (r <= 45), -1, 0)
+        )
 
+        # Stoch: K vs D, not extreme
         hh = h.rolling(STOCH_PERIOD).max()
         ll = l.rolling(STOCH_PERIOD).min()
         k = (100 * (c - ll) / (hh - ll).replace(0, np.nan)).rolling(STOCH_SMOOTH_K).mean()
         d = k.rolling(STOCH_SMOOTH_D).mean()
-        v["stoch"] = np.where(k > d, 1, -1)
+        stoch_call = (k > d) & (k < 80)
+        stoch_put  = (k < d) & (k > 20)
+        v["stoch"] = np.where(stoch_call, 1, np.where(stoch_put, -1, 0))
 
-        v["candle"] = np.where(c > o, 1, -1)
+        # Candle: body >= 60% of range, opposing wick < 30%
+        rng = (h - l).replace(0, np.nan)
+        body = (c - o).abs()
+        body_ok = body / rng >= 0.60
+        upper_wick = h - np.maximum(c, o)
+        lower_wick = np.minimum(c, o) - l
+        call_candle = (c > o) & body_ok & (upper_wick / rng < 0.30)
+        put_candle  = (c < o) & body_ok & (lower_wick / rng < 0.30)
+        v["candle"] = np.where(call_candle, 1, np.where(put_candle, -1, 0))
+
+        # Chop: last 5 closes stuck around EMA 21
+        band = (ema_slow * 0.0008).replace(0, np.nan)  # ~0.08%
+        near = (c - ema_slow).abs() < band
+        chop = near.rolling(5).sum() >= 4
+        v["chop"] = chop.fillna(False)
+
+        # Pullback: at least one of the last 3 bars touched near EMA 9, then current closed away
+        touch = (l <= ema_fast * 1.0005) & (h >= ema_fast * 0.9995)
+        recent_touch = touch.rolling(3).max().fillna(0).astype(bool)
+        away_call = c > ema_fast
+        away_put  = c < ema_fast
+        # Soften: if no recent touch, zero the trend vote so 6/6 cannot fire on a chase
+        v.loc[~recent_touch | ~away_call, "ema_trend"] = v.loc[
+            ~recent_touch | ~away_call, "ema_trend"
+        ].where(v.loc[~recent_touch | ~away_call, "ema_trend"] <= 0, 0)
+        v.loc[~recent_touch | ~away_put, "ema_trend"] = v.loc[
+            ~recent_touch | ~away_put, "ema_trend"
+        ].where(v.loc[~recent_touch | ~away_put, "ema_trend"] >= 0, 0)
 
         v["score"] = v[VOTE_COLS].sum(axis=1)
         return v
