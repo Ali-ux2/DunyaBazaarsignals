@@ -45,7 +45,7 @@ def count_request(n=1):
     request_count += n
 
 
-def sanitize(s: str) -> str:
+def sanitize(s) -> str:
     if s is None:
         return "—"
     return str(s).replace("`", "'").replace("*", "").replace("_", "-")
@@ -232,7 +232,6 @@ async def run_sniper_loop():
                     })
 
             if triggered:
-                # Highest votes first
                 triggered.sort(key=lambda x: x["votes"], reverse=True)
                 best = triggered[0]
 
@@ -311,35 +310,36 @@ async def cmd_resume(update, context):
 async def cmd_feed(update, context):
     if not is_admin(update): return
     try:
-        status = "🟢 ACTIVE" if IS_BOT_ACTIVE else "🔴 PAUSED"
-        text = (
-            f"📊 *DunyaBazaar 3-Pair Status*\n"
-            f"Engine: {status}\n"
-            f"Pairs: `{', '.join(PAIRS)}`\n"
-            f"MIN_SCORE: `{MIN_SCORE}` (only 6/6 fires)\n"
-            f"Requests today: `{request_count}` / 7000\n"
-            f"Next scan: `{next_scan_allowed.strftime('%H:%M:%S')}`\n\n"
-        )
+        status = "ACTIVE" if IS_BOT_ACTIVE else "PAUSED"
+        lines = [
+            "DunyaBazaar 3-Pair Status",
+            f"Engine: {status}",
+            f"Pairs: {', '.join(PAIRS)}",
+            f"MIN_SCORE: {MIN_SCORE} (only 6/6 fires)",
+            f"Requests today: {request_count} / 7000",
+            f"Next scan: {next_scan_allowed.strftime('%H:%M:%S')}",
+            "",
+        ]
         if pending_signals:
-            text += "*Pending entry:*\n"
+            lines.append("Pending entry:")
             for p in pending_signals:
-                text += f"• `{p}`\n"
+                lines.append(f"  - {p}")
         if active_trades:
-            text += "*Active trades:*\n"
+            lines.append("Active trades:")
             for p, t in active_trades.items():
-                text += (f"• `{p}` | {t['direction']} | "
-                         f"Entry `{t['entry_price']:.5f}` | "
-                         f"Exp `{t['expiry_time'].strftime('%H:%M')}`\n")
+                lines.append(
+                    f"  - {p} | {t['direction']} | "
+                    f"Entry {t['entry_price']:.5f} | "
+                    f"Exp {t['expiry_time'].strftime('%H:%M')}"
+                )
         if not pending_signals and not active_trades:
-            text += "_No active trades._"
+            lines.append("No active trades.")
 
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.error(f"cmd_feed error: {e}")
         try:
-            await update.message.reply_text(
-                f"⚠️ Status unavailable: {type(e).__name__}: {e}"
-            )
+            await update.message.reply_text(f"Status unavailable: {e}")
         except Exception:
             pass
 
