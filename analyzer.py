@@ -63,7 +63,6 @@ class S3Analyzer:
         votes = self._build_votes(df)
         last = votes.iloc[-1]
 
-        # Chop through EMA 21 — skip
         if bool(last.get("chop", False)):
             return None, 0.0
 
@@ -112,31 +111,26 @@ class S3Analyzer:
         ema_short_f = self._ema(c, EMA_SHORT_FAST)
         ema_short_s = self._ema(c, EMA_SHORT_SLOW)
 
-        # EMA trend: must be above/below AND sloping with the trade
         slope = ema_fast.diff()
         call_trend = (ema_fast > ema_slow) & (slope > 0)
         put_trend  = (ema_fast < ema_slow) & (slope < 0)
         v["ema_trend"] = np.where(call_trend, 1, np.where(put_trend, -1, 0))
 
-        # Short EMA
         v["ema_short"] = np.where(
             ema_short_f > ema_short_s, 1,
             np.where(ema_short_f < ema_short_s, -1, 0)
         )
 
-        # MACD histogram
         macd_line = self._ema(c, MACD_FAST) - self._ema(c, MACD_SLOW)
         hist = macd_line - self._ema(macd_line, MACD_SIGNAL)
         v["macd"] = np.where(hist > 0, 1, np.where(hist < 0, -1, 0))
 
-        # RSI: only the clean zone. 55-70 CALL, 30-45 PUT. Else 0.
         r = self._rsi(c, RSI_PERIOD)
         v["rsi"] = np.where(
             (r >= 55) & (r <= 70), 1,
             np.where((r >= 30) & (r <= 45), -1, 0)
         )
 
-        # Stoch: K vs D, not extreme
         hh = h.rolling(STOCH_PERIOD).max()
         ll = l.rolling(STOCH_PERIOD).min()
         k = (100 * (c - ll) / (hh - ll).replace(0, np.nan)).rolling(STOCH_SMOOTH_K).mean()
@@ -145,7 +139,6 @@ class S3Analyzer:
         stoch_put  = (k < d) & (k > 20)
         v["stoch"] = np.where(stoch_call, 1, np.where(stoch_put, -1, 0))
 
-        # Candle: body >= 60% of range, opposing wick < 30%
         rng = (h - l).replace(0, np.nan)
         body = (c - o).abs()
         body_ok = body / rng >= 0.60
@@ -155,18 +148,15 @@ class S3Analyzer:
         put_candle  = (c < o) & body_ok & (lower_wick / rng < 0.30)
         v["candle"] = np.where(call_candle, 1, np.where(put_candle, -1, 0))
 
-        # Chop: last 5 closes stuck around EMA 21
-        band = (ema_slow * 0.0008).replace(0, np.nan)  # ~0.08%
+        band = (ema_slow * 0.0008).replace(0, np.nan)
         near = (c - ema_slow).abs() < band
         chop = near.rolling(5).sum() >= 4
         v["chop"] = chop.fillna(False)
 
-        # Pullback: at least one of the last 3 bars touched near EMA 9, then current closed away
         touch = (l <= ema_fast * 1.0005) & (h >= ema_fast * 0.9995)
         recent_touch = touch.rolling(3).max().fillna(0).astype(bool)
         away_call = c > ema_fast
         away_put  = c < ema_fast
-        # Soften: if no recent touch, zero the trend vote so 6/6 cannot fire on a chase
         v.loc[~recent_touch | ~away_call, "ema_trend"] = v.loc[
             ~recent_touch | ~away_call, "ema_trend"
         ].where(v.loc[~recent_touch | ~away_call, "ema_trend"] <= 0, 0)

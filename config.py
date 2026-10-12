@@ -9,16 +9,28 @@ CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
 OTCHARTS_API_KEY = os.environ.get("OTCHARTS_API_KEY")
 ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID")
 
-# --- Pairs to scan (3 pairs) ---
+# --- Pairs to scan (OTC) ---
 PAIRS = [
     "USDBRL_otc",   # Brazilian Real
     "USDMXN_otc",   # Mexican Peso
     "USDINR_otc",   # Indian Rupee
+    "USDPKR_otc",   # Pakistani Rupee
+    "USDDZD_otc",   # Algerian Dinar
+    "USDARS_otc",   # Argentine Peso
+    "USDBDT_otc",   # Bangladeshi Taka
+    "USDCOP_otc",   # Colombian Peso
+    "USDIDR_otc",   # Indonesian Rupiah
+    "USDPHP_otc",   # Philippine Peso
+    "USDEGP_otc",   # Egyptian Pound
+    "USDNGN_otc",   # Nigerian Naira
+    "CADCHF_otc",   # Canadian Dollar / Swiss Franc
+    "NZDCHF_otc",   # New Zealand Dollar / Swiss Franc
+    "NZDJPY_otc",   # New Zealand Dollar / Japanese Yen
+    "GBPNZD_otc",   # British Pound / New Zealand Dollar
 ]
 
 # --- Vote-based confluence ---
-# Note: with always-fire votes, scores are always EVEN.
-# MIN_SCORE = 6 → only 6/6 votes fire.
+# MIN_SCORE = 6 → all 6 quality votes must agree.
 MIN_SCORE = 6
 
 # Vote periods
