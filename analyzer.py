@@ -1,23 +1,13 @@
 """
-Analyzer — always-fire confluence for higher signal frequency.
-
-6 indicators vote +1 (CALL) or -1 (PUT) every candle. No neutral zone.
-Score = sum. Signal when |score| >= MIN_SCORE.
-
-Votes:
-  1. EMA9 vs EMA21 (trend)
-  2. EMA5 vs EMA20 (short trend)
-  3. MACD histogram vs 0 (momentum)
-  4. RSI vs 50 (momentum bias)
-  5. Stochastic K vs D (fast momentum)
-  6. Last candle close vs open (immediate pressure)
+Vote-based confluence analyzer — always-fire 6 votes, multi-pair.
+Score = sum of votes. Signal when |score| >= MIN_SCORE.
 """
 
 import numpy as np
 import pandas as pd
 from collections import deque
 from config import (
-    MIN_SCORE,
+    PAIRS, MIN_SCORE,
     EMA_TREND_FAST, EMA_TREND_SLOW,
     EMA_SHORT_FAST, EMA_SHORT_SLOW,
     RSI_PERIOD, BB_PERIOD, BB_STD,
@@ -37,20 +27,18 @@ VOTE_LABELS = {
     "candle":    "Last candle direction",
 }
 
+TOTAL_VOTES = 6
+
 
 class S3Analyzer:
-    def __init__(self, pairs=None):
-        if pairs is None:
-            from config import ACTIVE_PAIR
-            pairs = [ACTIVE_PAIR]
-        self.pairs = pairs
-        self.opens  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
-        self.highs  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
-        self.lows   = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
-        self.closes = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
-        self.last_signal = {p: None for p in pairs}
+    def __init__(self):
+        self.pairs = PAIRS
+        self.opens  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
+        self.highs  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
+        self.lows   = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
+        self.closes = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
+        self.last_signal = {p: None for p in PAIRS}
 
-    # -----------------------------------------------------------------
     def analyze(self, pair, price, high=None, low=None, open_=None):
         if high is None: high = price
         if low is None:  low = price
@@ -78,7 +66,7 @@ class S3Analyzer:
             return None, 0.0
 
         direction = "CALL" if score > 0 else "PUT"
-        confidence = min(abs(score) / len(VOTE_COLS), 1.0) * 100.0
+        confidence = min(abs(score) / TOTAL_VOTES, 1.0) * 100.0
         return direction, confidence
 
     def latest_explanation(self, pair):
@@ -97,7 +85,6 @@ class S3Analyzer:
             "put_reasons":  [VOTE_LABELS[c] for c in VOTE_COLS if int(v[c]) < 0],
         }
 
-    # -----------------------------------------------------------------
     @staticmethod
     def _ema(s, n):
         return s.ewm(span=n, adjust=False).mean()
@@ -113,33 +100,26 @@ class S3Analyzer:
         c, o, h, l = df["close"], df["open"], df["high"], df["low"]
         v = pd.DataFrame(index=df.index)
 
-        # 1. EMA trend
         v["ema_trend"] = np.where(
             self._ema(c, EMA_TREND_FAST) > self._ema(c, EMA_TREND_SLOW), 1, -1
         )
-
-        # 2. Short EMA
         v["ema_short"] = np.where(
             self._ema(c, EMA_SHORT_FAST) > self._ema(c, EMA_SHORT_SLOW), 1, -1
         )
 
-        # 3. MACD histogram sign
         macd_line = self._ema(c, MACD_FAST) - self._ema(c, MACD_SLOW)
         hist = macd_line - self._ema(macd_line, MACD_SIGNAL)
         v["macd"] = np.where(hist > 0, 1, -1)
 
-        # 4. RSI vs 50
         r = self._rsi(c, RSI_PERIOD)
         v["rsi"] = np.where(r > 50, 1, -1)
 
-        # 5. Stoch K vs D
         hh = h.rolling(STOCH_PERIOD).max()
         ll = l.rolling(STOCH_PERIOD).min()
         k = (100 * (c - ll) / (hh - ll).replace(0, np.nan)).rolling(STOCH_SMOOTH_K).mean()
         d = k.rolling(STOCH_SMOOTH_D).mean()
         v["stoch"] = np.where(k > d, 1, -1)
 
-        # 6. Candle direction
         v["candle"] = np.where(c > o, 1, -1)
 
         v["score"] = v[VOTE_COLS].sum(axis=1)
