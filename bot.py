@@ -45,12 +45,6 @@ def count_request(n=1):
     request_count += n
 
 
-def sanitize(s) -> str:
-    if s is None:
-        return "—"
-    return str(s).replace("`", "'").replace("*", "").replace("_", "-")
-
-
 async def send_admin_feedback(text):
     try:
         await bot.send_message(chat_id=ADMIN_ID, text=text)
@@ -58,8 +52,7 @@ async def send_admin_feedback(text):
         logger.error(f"Admin feedback error: {e}")
 
 
-async def send_signal_with_chart(pair, direction, strength,
-                                  entry_time_str, vote_count):
+async def send_signal_with_chart(pair, direction, strength, entry_time_str, vote_count):
     try:
         bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=50)
         count_request()
@@ -131,7 +124,6 @@ async def run_sniper_loop():
     global next_scan_allowed
     logger.info(f"Starting DunyaBazaar 3-PAIR engine — {', '.join(PAIRS)}")
 
-    # Warmup all pairs
     for pair in PAIRS:
         try:
             bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME,
@@ -218,7 +210,7 @@ async def run_sniper_loop():
                 if pair in pending_signals or pair in active_trades:
                     continue
                 expl = analyzer.latest_explanation(pair)
-                if expl is None:
+                if expl is None:            # chop OR not enough history
                     continue
                 score = expl["score"]
                 if abs(score) >= MIN_SCORE:
@@ -251,14 +243,14 @@ async def run_sniper_loop():
                     }
                     next_scan_allowed = now + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
                     logger.info(
-                        f"Signal sent ({best['pair']}, {best['votes']}/6). "
+                        f"Signal sent ({best['pair']}, {best['votes']}/{TOTAL_VOTES}). "
                         f"Next scan at {next_scan_allowed.strftime('%H:%M:%S')}"
                     )
                 else:
                     logger.warning("Signal send failed. Skipping trade registration.")
             else:
                 await send_admin_feedback(f"⚪ No setup at {now.strftime('%H:%M')}")
-                logger.info("No 6/6 setup across all 3 pairs.")
+                logger.info("No setup across all 3 pairs.")
 
         await asyncio.sleep(1)
 
@@ -315,7 +307,7 @@ async def cmd_feed(update, context):
             "DunyaBazaar 3-Pair Status",
             f"Engine: {status}",
             f"Pairs: {', '.join(PAIRS)}",
-            f"MIN_SCORE: {MIN_SCORE} (only 6/6 fires)",
+            f"MIN_SCORE: {MIN_SCORE} of {TOTAL_VOTES}",
             f"Requests today: {request_count} / 7000",
             f"Next scan: {next_scan_allowed.strftime('%H:%M:%S')}",
             "",
