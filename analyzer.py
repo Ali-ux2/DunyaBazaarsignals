@@ -1,8 +1,3 @@
-"""
-S3 Confluence Analyzer — rare-event votes, chop filter, M1.
-Each vote can be +1, -1, or 0. Signal when |score| >= MIN_SCORE.
-"""
-
 import numpy as np
 import pandas as pd
 from collections import deque
@@ -30,15 +25,19 @@ VOTE_LABELS = {
 
 
 class S3Analyzer:
-    def __init__(self):
-        self.opens  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
-        self.highs  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
-        self.lows   = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
-        self.closes = {p: deque(maxlen=CANDLES_TO_TRACK) for p in PAIRS}
-        self.last_signal = {p: None for p in PAIRS}
+    def __init__(self, pairs=None):
+        if pairs is None:
+            pairs = PAIRS
+        self.pairs = pairs
+        self.opens  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
+        self.highs  = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
+        self.lows   = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
+        self.closes = {p: deque(maxlen=CANDLES_TO_TRACK) for p in pairs}
+        self.last_signal = {p: None for p in pairs}
 
-    # ------------------------------------------------------------------
     def analyze(self, pair, price, high=None, low=None, open_=None):
+        if pair not in self.closes:
+            return None, 0.0
         if high is None: high = price
         if low is None:  low = price
         if open_ is None:
@@ -68,12 +67,13 @@ class S3Analyzer:
         return direction, confidence
 
     def latest_explanation(self, pair):
-        """Returns None if choppy OR not enough history — otherwise dict."""
+        if pair not in self.closes:
+            return None
         if len(self.closes[pair]) < CANDLES_MIN_REQUIRED:
             return None
         df = self._make_df(pair)
         v = self._build_votes(df).iloc[-1]
-        if bool(v.get("chop", False)):          # <-- THE FIX
+        if bool(v.get("chop", False)):
             return None
         return {
             "score": int(v["score"]),
@@ -82,7 +82,6 @@ class S3Analyzer:
             "put_reasons":  [VOTE_LABELS[c] for c in VOTE_COLS if int(v[c]) < 0],
         }
 
-    # ------------------------------------------------------------------
     def _make_df(self, pair):
         return pd.DataFrame({
             "open":  list(self.opens[pair]),
@@ -102,48 +101,40 @@ class S3Analyzer:
         dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
         return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
-    # ------------------------------------------------------------------
     def _build_votes(self, df):
         c, o, h, l = df["close"], df["open"], df["high"], df["low"]
         v = pd.DataFrame(index=df.index)
 
-        ema_fast  = self._ema(c, EMA_TREND_FAST)
-        ema_slow  = self._ema(c, EMA_TREND_SLOW)
-        ema_sf    = self._ema(c, EMA_SHORT_FAST)
-        ema_ss    = self._ema(c, EMA_SHORT_SLOW)
+        ema_fast = self._ema(c, EMA_TREND_FAST)
+        ema_slow = self._ema(c, EMA_TREND_SLOW)
+        ema_sf   = self._ema(c, EMA_SHORT_FAST)
+        ema_ss   = self._ema(c, EMA_SHORT_SLOW)
 
-        # ---------------- Vote 1: EMA trend + slope + bounce ----------------
         slope = ema_fast.diff()
         call_base = (ema_fast > ema_slow) & (slope > 0)
         put_base  = (ema_fast < ema_slow) & (slope < 0)
 
-        # Require price touched EMA fast recently AND is now on the right side
         touch = (l <= ema_fast * 1.0005) & (h >= ema_fast * 0.9995)
         recent_touch = touch.rolling(3).max().fillna(0).astype(bool)
 
         call_valid = call_base & recent_touch & (c > ema_fast)
         put_valid  = put_base  & recent_touch & (c < ema_fast)
-
         v["ema_trend"] = np.where(call_valid, 1, np.where(put_valid, -1, 0))
 
-        # ---------------- Vote 2: short EMA trend ----------------
         v["ema_short"] = np.where(
             ema_sf > ema_ss, 1, np.where(ema_sf < ema_ss, -1, 0)
         )
 
-        # ---------------- Vote 3: MACD histogram ----------------
         macd_line = self._ema(c, MACD_FAST) - self._ema(c, MACD_SLOW)
         hist = macd_line - self._ema(macd_line, MACD_SIGNAL)
         v["macd"] = np.where(hist > 0, 1, np.where(hist < 0, -1, 0))
 
-        # ---------------- Vote 4: RSI in clean zone ----------------
         r = self._rsi(c, RSI_PERIOD)
         v["rsi"] = np.where(
             (r >= 55) & (r <= 70), 1,
             np.where((r >= 30) & (r <= 45), -1, 0)
         )
 
-        # ---------------- Vote 5: Stochastic K vs D, non-extreme ----------------
         hh = h.rolling(STOCH_PERIOD).max()
         ll = l.rolling(STOCH_PERIOD).min()
         k = (100 * (c - ll) / (hh - ll).replace(0, np.nan)).rolling(STOCH_SMOOTH_K).mean()
@@ -152,7 +143,6 @@ class S3Analyzer:
         stoch_put  = (k < d) & (k > 20)
         v["stoch"] = np.where(stoch_call, 1, np.where(stoch_put, -1, 0))
 
-        # ---------------- Vote 6: Clean body candle ----------------
         rng = (h - l).replace(0, np.nan)
         body = (c - o).abs()
         body_ok = body / rng >= 0.60
@@ -162,7 +152,6 @@ class S3Analyzer:
         put_candle  = (c < o) & body_ok & (lower_wick / rng < 0.30)
         v["candle"] = np.where(call_candle, 1, np.where(put_candle, -1, 0))
 
-        # ---------------- Chop filter ----------------
         band = (ema_slow * 0.0008).replace(0, np.nan)
         near = (c - ema_slow).abs() < band
         chop = near.rolling(5).sum() >= 4

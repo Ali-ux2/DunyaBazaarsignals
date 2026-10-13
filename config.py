@@ -9,15 +9,24 @@ CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
 OTCHARTS_API_KEY = os.environ.get("OTCHARTS_API_KEY")
 ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID")
 
-# --- Pairs ---
+# --- Pairs to TRY (bot verifies each at startup, skips broken ones) ---
 PAIRS = [
-    "USDBRL_otc",
-    "USDMXN_otc",
     "USDINR_otc",
+    "USDMXN_otc",
+    "USDARS_otc",
+    "USDPKR_otc",
+    "USDBDT_otc",
+    "USDCOP_otc",
+    "USDPHP_otc",
+    "USDIDR_otc",
+    "USDEGP_otc",
+    "USDNGN_otc",
+    "USDDZD_otc",
+    "USDBRL_otc",   # may not exist — will be auto-skipped if so
 ]
 
 # --- Confluence ---
-MIN_SCORE = 4   # 4 of 6 votes must agree
+MIN_SCORE = 4
 
 EMA_TREND_FAST = 9
 EMA_TREND_SLOW = 21

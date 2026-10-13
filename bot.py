@@ -23,7 +23,10 @@ logger = logging.getLogger(__name__)
 
 otc = Client(api_key=OTCHARTS_API_KEY)
 bot = Bot(token=BOT_TOKEN)
-analyzer = S3Analyzer()
+
+# Reassigned after verification
+analyzer = None
+VALID_PAIRS = []
 
 LOCAL_TZ = ZoneInfo("Africa/Nairobi")
 IS_BOT_ACTIVE = True
@@ -57,7 +60,6 @@ async def send_signal_with_chart(pair, direction, strength, entry_time_str, vote
         bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=50)
         count_request()
         if not bars:
-            logger.warning(f"No candles for chart on {pair}")
             return False
         chart_buf = generate_candle_chart(bars, pair)
 
@@ -120,11 +122,45 @@ async def send_result_message(result_text):
         logger.error(f"Result send error: {e}")
 
 
-async def run_sniper_loop():
-    global next_scan_allowed
-    logger.info(f"Starting DunyaBazaar 3-PAIR engine — {', '.join(PAIRS)}")
-
+async def verify_pairs():
+    """Test each pair; keep only ones that return candles."""
+    global VALID_PAIRS
+    valid = []
+    logger.info(f"Verifying {len(PAIRS)} pairs...")
     for pair in PAIRS:
+        try:
+            bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=2)
+            count_request()
+            if bars and len(bars) > 0:
+                valid.append(pair)
+                logger.info(f"✅ {pair}")
+            else:
+                logger.warning(f"❌ {pair} — no candles")
+        except Exception as e:
+            logger.warning(f"❌ {pair} — {e}")
+        await asyncio.sleep(0.3)
+    VALID_PAIRS = valid
+    logger.info(f"Verified {len(VALID_PAIRS)}/{len(PAIRS)} pairs: {', '.join(VALID_PAIRS)}")
+    return valid
+
+
+async def run_sniper_loop():
+    global analyzer, next_scan_allowed
+
+    logger.info("Starting DunyaBazaar engine...")
+
+    # 1. Verify pairs first
+    valid = await verify_pairs()
+    if not valid:
+        logger.error("No valid pairs! Bot cannot run.")
+        await send_admin_feedback("🚨 ERROR: No valid pairs found on Quotex.")
+        return
+
+    # 2. Initialize analyzer with valid pairs only
+    analyzer = S3Analyzer(pairs=valid)
+
+    # 3. Warmup
+    for pair in VALID_PAIRS:
         try:
             bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME,
                                limit=CANDLES_FOR_WARMUP)
@@ -137,6 +173,9 @@ async def run_sniper_loop():
         await asyncio.sleep(0.3)
 
     logger.info("Warmup complete. Entering main loop.")
+    await send_admin_feedback(
+        f"✅ Bot started. Valid pairs: {', '.join(VALID_PAIRS)} ({len(VALID_PAIRS)}/{len(PAIRS)})"
+    )
 
     while True:
         if not IS_BOT_ACTIVE:
@@ -146,9 +185,9 @@ async def run_sniper_loop():
         now = datetime.now(LOCAL_TZ)
         seconds = now.second
 
-        # :03 — feed just-closed candle for all pairs
+        # :03 — feed closed candle
         if seconds == 3:
-            for pair in PAIRS:
+            for pair in VALID_PAIRS:
                 try:
                     bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=1)
                     count_request()
@@ -158,7 +197,7 @@ async def run_sniper_loop():
                 except Exception as e:
                     logger.error(f"Candle feed error {pair}: {e}")
 
-        # :01 — capture entries + evaluate expired trades
+        # :01 — capture entries + evaluate
         elif seconds == 1:
             for pair in list(pending_signals.keys()):
                 try:
@@ -203,14 +242,14 @@ async def run_sniper_loop():
                 except Exception as e:
                     logger.error(f"Eval error {pair}: {e}")
 
-        # :52 — scan all pairs, pick strongest signal
+        # :52 — scan
         elif seconds == 52 and now >= next_scan_allowed:
             triggered = []
-            for pair in PAIRS:
+            for pair in VALID_PAIRS:
                 if pair in pending_signals or pair in active_trades:
                     continue
                 expl = analyzer.latest_explanation(pair)
-                if expl is None:            # chop OR not enough history
+                if expl is None:
                     continue
                 score = expl["score"]
                 if abs(score) >= MIN_SCORE:
@@ -247,10 +286,9 @@ async def run_sniper_loop():
                         f"Next scan at {next_scan_allowed.strftime('%H:%M:%S')}"
                     )
                 else:
-                    logger.warning("Signal send failed. Skipping trade registration.")
+                    logger.warning("Signal send failed.")
             else:
-                await send_admin_feedback(f"⚪ No setup at {now.strftime('%H:%M')}")
-                logger.info("No setup across all 3 pairs.")
+                logger.info(f"No setup across {len(VALID_PAIRS)} pairs.")
 
         await asyncio.sleep(1)
 
@@ -304,9 +342,10 @@ async def cmd_feed(update, context):
     try:
         status = "ACTIVE" if IS_BOT_ACTIVE else "PAUSED"
         lines = [
-            "DunyaBazaar 3-Pair Status",
+            "DunyaBazaar Status",
             f"Engine: {status}",
-            f"Pairs: {', '.join(PAIRS)}",
+            f"Valid pairs: {len(VALID_PAIRS)}/{len(PAIRS)}",
+            f"  {', '.join(VALID_PAIRS) if VALID_PAIRS else 'none yet'}",
             f"MIN_SCORE: {MIN_SCORE} of {TOTAL_VOTES}",
             f"Requests today: {request_count} / 7000",
             f"Next scan: {next_scan_allowed.strftime('%H:%M:%S')}",
@@ -326,7 +365,6 @@ async def cmd_feed(update, context):
                 )
         if not pending_signals and not active_trades:
             lines.append("No active trades.")
-
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.error(f"cmd_feed error: {e}")
@@ -338,8 +376,9 @@ async def cmd_feed(update, context):
 
 async def cmd_testcard(update, context):
     if not is_admin(update): return
+    pair = VALID_PAIRS[0] if VALID_PAIRS else "USDINR_otc"
     try:
-        await send_signal_with_chart("USDINR_otc", "PUT", 100, "17:59", 6)
+        await send_signal_with_chart(pair, "PUT", 67, "17:59", 4)
         await update.message.reply_text("✅ Test card sent.")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
@@ -370,7 +409,6 @@ async def main():
             ("testcard", "Send a test signal"),
             ("help", "Show available commands"),
         ])
-        logger.info("Command menu registered.")
     except Exception as e:
         logger.error(f"set_my_commands failed: {e}")
 
