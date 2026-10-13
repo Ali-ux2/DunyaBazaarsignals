@@ -17,7 +17,7 @@ PAIRS = [
 ]
 
 # --- Confluence ---
-MIN_SCORE = 5   # 5 of 6 votes must agree
+MIN_SCORE = 4   # 4 of 6 votes must agree
 
 EMA_TREND_FAST = 9
 EMA_TREND_SLOW = 21
