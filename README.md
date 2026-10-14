@@ -17,6 +17,7 @@ Files: `analyzer.py` (signal engine + backtest), `config.py` (all settings), `bo
 | `PRECHECK_MODE` | | `confirm` (default), `log`, `off` |
 | `PRECHECK_SECOND` | | default `57` |
 | `PAIRS` | | optional comma list, default: all 12 pairs |
+| `SHADOW_RELAXED` | | `1` (default) runs the relaxed shadow engine (admin chat only, never posted); `0` turns it off |
 | `STATE_DIR` | | optional; point at a Railway Volume mount so `pair_stats.json` survives redeploys |
 | `DATA_SOURCE`, `REPLAY_CSV`, `TELEGRAM_ENABLED`, `DRY_RUN_MINUTES` | | testing only |
 
@@ -24,7 +25,7 @@ If a required one is missing the bot logs `Missing required env vars: ...` and e
 The bot must be an admin of the channel to post. Deploy as a worker (Procfile `worker: python bot.py`).
 
 ## Admin commands (from TELEGRAM_ADMIN_ID only)
-`/pause`, `/resume`, `/status`, `/test` (alias `/testcard`: posts one sample card to the group, headed `🧪 TEST CARD — NOT A LIVE SIGNAL`; no stats/trades/cooldowns touched), `/help`. Stop the Railway service between sessions, or use `/pause` / `SESSIONS_UTC`.
+`/pause`, `/resume`, `/status`, `/shadow` (relaxed shadow stats: per-pair W/L, win rate vs breakeven), `/test` (alias `/testcard`: posts one sample card to the group, headed `🧪 TEST CARD — NOT A LIVE SIGNAL`; no stats/trades/cooldowns touched), `/help`. Stop the Railway service between sessions, or use `/pause` / `SESSIONS_UTC`.
 
 ## Loop
 Every minute at :02 UTC (the closed candle, not :52 on an unfinished one): fetch `/v1/candles` per pair
@@ -132,3 +133,42 @@ breakeven gate active. If no pair qualifies, the slot stays empty and this is lo
 - **Reconnects:** automatic with backoff 2→60 s; 5 min after a 429. A `dropped` event reopens the stream after 3 min. Only one connection is ever held.
 - **Railway:** mount a volume at `STATE_DIR` so candles, payouts and resolutions survive restarts.
 - **Tests:** `python test_stream.py`; dry-run: `DATA_SOURCE=mockstream TELEGRAM_ENABLED=0 DRY_RUN_MINUTES=400 python bot.py`.
+
+## Relaxed shadow engine (`SHADOW_RELAXED`, default on)
+On every closed-candle scan the bot also runs a **relaxed** copy of the engine on the same candles (no extra OTCharts requests).
+When the relaxed engine signals a pair that the strict engine did not, the **admin chat only** gets
+`👻 Shadow (relaxed): USDINR CALL entry 16:42 — not posted`. At expiry it is resolved from candles already fetched/streamed
+(`👻 Shadow result USDINR: WIN/LOSS`). Shadow trades are never posted to the group and never affect real signals, the :57 check,
+cooldowns, compounding, the pair gate or real stats. They are stored separately in `STATE_DIR/shadow_stats.json` and
+`STATE_DIR/shadow_trades.csv`, shown by `/shadow`, and added to the daily summary as a "Shadow (relaxed)" section.
+
+| Setting | Strict | Relaxed shadow |
+|---|---|---|
+| Min confluence (`MIN_CONF`) | 0.70 | 0.55 |
+| ADX trend / range | 25 / 18 | 21 / 20 |
+| Efficiency ratio for trend | 0.35 | 0.25 |
+| ATR percentile window | 20–95 | 10–98 |
+| Min S/R range | 3.0 ATR | 2.0 ATR |
+| Strong-candle body | 0.60 | 0.50 |
+| Chop reject | 4 of 5 bars | 5 of 5 bars |
+| Conflicting votes | reject | allowed, net score decides |
+| Overlap rule | log/require | ignored |
+| Pair win-rate gate | on | off (shadow has its own stats) |
+| 77% payout floor, gap rejection | on | **on (unchanged)** |
+
+Limits: shadows are only evaluated on minutes when the strict scan runs (not during a pending trade/cooldown or pause);
+in poll mode a shadow result waits until that pair's candles are next fetched (gives `UNKNOWN` after 20 min); in auto mode
+after the switch to stream, shadows on non-stream pairs may end `UNKNOWN`. One open shadow per pair, 3-min cooldown per pair.
+
+## Stream reliability (one connection, 429 handling, fallback)
+- Only ONE `/v1/stream` connection can exist in the process: a process-wide lock, the old response/socket/session is closed before
+  every reconnect, and a new stream object closes any older one. SIGTERM (Railway restart/redeploy) closes the stream right away.
+- 429 is classified from the body: **stream in use** ("one live stream at once ... 1 is open") or **daily quota exhausted**.
+  Retries back off 60 → 120 → 300 → 600 s (cap). Before retrying after "in use" the bot checks the free `/v1/usage` `streams.open`.
+  The admin chat gets ONE `🔴 Stream down: ...` per episode and ONE `🟢 Stream reconnected`.
+- Watchdog: no tick on any stream pair for > 90 s (`STREAM_STALE_SEC`) = dropped → close and reconnect.
+- While the stream is down, `STREAM_FALLBACK_POLL=1` (default) polls the 5 stream pairs over REST (≈5 requests/min) as long as
+  usage is below quota − `STREAM_FALLBACK_RESERVE` (default 50). If the budget is exhausted, signals pause and the admin chat is told once.
+- OTCharts has no endpoint to list or close streams (no DELETE, no stream id). The slot is freed when the connection closes.
+  The limit is per ACCOUNT across all keys, so any other program/deploy holding a stream with the same account blocks this one.
+  On Railway, turn off overlapping deploys (or expect up to a few retries during a redeploy while the old container shuts down).

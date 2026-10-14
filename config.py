@@ -114,6 +114,27 @@ ATR_PCTL_MIN_PERIODS = 30   # ATR percentile uses whatever window exists (>=30 b
 OVERLAP_MODE = _env("OVERLAP_MODE", default="log")  # off | log | require (filter only, never creates signals)
 OVERLAP_LOOKBACK = 5
 MAX_GAP_RUNS = 0         # reject if the recent window has feed gaps
+ALLOW_CONFLICT = False   # strict: any opposing vote rejects the setup
+
+# ---- relaxed SHADOW engine (admin chat only; never posted, never touches real trades/stats/compounding) ----
+SHADOW_RELAXED = _env("SHADOW_RELAXED", default="1").lower() in ("1", "true", "yes", "on")
+SHADOW_STATS_FILE = os.path.join(STATE_DIR, "shadow_stats.json")
+SHADOW_LOG = os.path.join(STATE_DIR, "shadow_trades.csv")
+SHADOW_MAX_WAIT_MIN = 20     # give up resolving a shadow trade if its candle never shows up in already-fetched data
+# Overrides applied ONLY inside the shadow evaluation. Payout floor (MIN_PAYOUT) and gap rejection are NOT relaxed.
+SHADOW_OVERRIDES = dict(
+    MIN_CONF=0.55,           # strict 0.70
+    ADX_TREND=21,            # strict 25
+    ADX_RANGE=20,            # strict 18 (narrower "unclear" band)
+    ER_TREND=0.25,           # strict 0.35
+    ATR_PCTL_MIN=10,         # strict 20
+    ATR_PCTL_MAX=98,         # strict 95
+    SR_MIN_RANGE_ATR=2.0,    # strict 3.0
+    BODY_MIN=0.50,           # strict 0.60
+    CHOP_BARS=5,             # strict 4 (chop must be 5/5 bars to reject)
+    ALLOW_CONFLICT=True,     # strict False: net weighted score decides
+    OVERLAP_MODE="off",      # strict log/require: ignored
+)
 
 # ---- payout / pair management (NO martingale) ----
 MIN_PAYOUT = 0.77        # never signal below 77%
@@ -125,10 +146,14 @@ MIN_TRADES_FOR_GATE = 30
 # ---- stream mode ----
 STREAM_PAIRS = [p.strip().upper() for p in _env("STREAM_PAIRS", default="USDINR,USDIDR,USDCOP,USDMXN,USDBRL").split(",") if p.strip()]
 STREAM_MAX_INSTRUMENTS = int(_env("STREAM_MAX_INSTRUMENTS", default="5"))   # Lite plan: 1 stream x 5 instruments
-STREAM_429_BACKOFF_SEC = 300
+STREAM_429_BACKOFF_SEC = 300       # legacy (unused)
+STREAM_429_BACKOFFS = [60, 120, 300, 600]   # 429 retry schedule, capped at 600 s
+STREAM_FALLBACK_POLL = _env("STREAM_FALLBACK_POLL", default="1").lower() in ("1", "true", "yes", "on")  # poll stream pairs while the stream is down
+STREAM_FALLBACK_RESERVE = int(_env("STREAM_FALLBACK_RESERVE", default="50"))  # keep this many requests unspent
+STREAM_WATCHDOG_SEC = 15            # how often the tick watchdog checks
 STREAM_SWITCH_AT = float(_env("STREAM_SWITCH_AT", default="0.93"))  # auto: open the stream while its 1 request is still available
 STREAM_REOPEN_DROPPED_MIN = 3
-STREAM_STALE_SEC = 90               # no tick for this long counts as a feed gap
+STREAM_STALE_SEC = 90               # no tick for this long: feed gap AND the watchdog closes + reconnects the stream
 STREAM_FALLBACK_PAYOUT = float(_env("STREAM_FALLBACK_PAYOUT", default="0.85"))  # used only if no live/cached payout
 PERSIST_CANDLES = 300
 CANDLE_DIR = os.path.join(STATE_DIR, "candles")

@@ -6,7 +6,7 @@ import json, logging, os, signal, sys, threading, time
 from datetime import datetime, timedelta, timezone
 import pandas as pd, requests
 import config as C
-from analyzer import analyze, compute, tracker, breakeven, precheck, precheck_flip_kind
+from analyzer import analyze, analyze_relaxed, compute, tracker, shadow_tracker, breakeven, precheck, precheck_flip_kind
 from resolver import resolve, describe, Resolution
 from chart import result_caption, render_result_chart, render_chart, signal_caption, display_name
 
@@ -115,6 +115,7 @@ class OTChartsAdapter:
         return self.meta
 
     def usage(self): return self._get("/v1/usage").get("requests", {})
+    def usage_raw(self): return self._get("/v1/usage")   # free; includes "streams": {"open","limit"}
 
     def fetch_candles(self, pair, limit):
         """One /v1/candles call (stream warm-up). Returns closed candles in true UTC."""
@@ -209,7 +210,11 @@ class Bot:
         self.compound_active = list(C.COMPOUND_PAIRS); self.lost_ladders = {}; self.rotated_out = set(); self.ladder = {}
         self.block_until = None        # cooldown end (datetime)
         self.sessions = parse_sessions(C.SESSIONS_UTC); self.usage_at = 0.0
-        self.load_stats()
+        self.shadow_open = []           # relaxed shadow trades awaiting their result (admin only)
+        self.shadow_day = {}            # pair -> [W, L] for today's summary
+        self.shadow_payout = {}         # pair -> [sum payout, n] for the breakeven comparison
+        self.shadow_next = {}           # pair -> datetime (per-pair shadow cooldown)
+        self.load_stats(); self.load_shadow()
 
     # ---- persistence ----
     def load_stats(self):
@@ -222,15 +227,112 @@ class Bot:
         with open(tmp, "w") as f: json.dump(tracker.to_json(), f)
         os.replace(tmp, C.STATS_FILE)
 
+    # ---- shadow (relaxed) persistence ----
+    def load_shadow(self):
+        try:
+            with open(C.SHADOW_STATS_FILE) as f: j = json.load(f)
+            shadow_tracker.load(j.get("tracker", {})); self.shadow_payout = j.get("payout", {})
+            if j.get("day_date") == str(self.day_date): self.shadow_day = j.get("day", {})
+            log.info("Loaded shadow stats for %d pairs", len(shadow_tracker.total))
+        except FileNotFoundError: pass
+        except Exception as e: log.warning("Shadow stats unreadable (%s); starting fresh", e)
+    def save_shadow(self):
+        tmp = C.SHADOW_STATS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"tracker": shadow_tracker.to_json(), "payout": self.shadow_payout,
+                       "day": self.shadow_day, "day_date": str(self.day_date)}, f)
+        os.replace(tmp, C.SHADOW_STATS_FILE)
+
+    # ---- shadow (relaxed) engine: admin chat only, never posted, never touches real trades ----
+    def shadow_eval(self, df, x, pair, payout, gaps, now):
+        if any(t["pair"] == pair for t in self.shadow_open): return
+        if self.shadow_next.get(pair) and now < self.shadow_next[pair]: return
+        try: s = analyze_relaxed(df, pair, payout=payout, gaps=gaps, x=x)
+        except Exception as e: log.warning("shadow %s: %s", pair, e); return
+        if not s.get("signal"): return
+        entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        t = {"pair": pair, "signal": s["signal"], "entry_at": entry, "settle_at": entry + timedelta(minutes=C.EXPIRY_MIN),
+             "payout": s["payout"], "confidence": s["confidence"], "regime": s["regime"]}
+        self.shadow_open.append(t); self.shadow_next[pair] = now + timedelta(minutes=C.SIGNAL_COOLDOWN_MIN)
+        self.tg.admin(f"👻 Shadow (relaxed): {pair} {s['signal']} entry {entry:%H:%M} — not posted "
+                      f"({s['regime']}, {s['confidence']}%, payout {s['payout']:.0%})")
+
+    def cached_candles(self, pair):
+        # Closed candles already in memory: NO OTCharts request is made here.
+        for d in (self.d, self.poll_adapter):
+            if d is None: continue
+            if isinstance(d, OTChartsAdapter):
+                df = d.cache.get(pair)
+                if df is not None and len(df): return closed_only(df, self.d.now())
+            elif hasattr(d, "books") or isinstance(d, ReplayAdapter):   # stream books / local replay: free
+                try:
+                    df, _, _ = d.candles(pair)
+                    if df is not None and len(df): return df
+                except Exception: pass
+        return None
+
+    def shadow_resolve(self):
+        now = self.d.now(); keep = []
+        for t in self.shadow_open:
+            if now < t["settle_at"]: keep.append(t); continue
+            df = self.cached_candles(t["pair"])
+            bar = df.loc[df.index == t["entry_at"]] if df is not None else None
+            if bar is None or bar.empty:
+                if now - t["settle_at"] > timedelta(minutes=C.SHADOW_MAX_WAIT_MIN):
+                    self.tg.admin(f"👻 Shadow result {t['pair']}: UNKNOWN (entry candle never fetched)")
+                    self.log_shadow(t, float("nan"), float("nan"), "UNKNOWN")
+                else: keep.append(t)
+                continue
+            o, c = float(bar.open.iloc[0]), float(bar.close.iloc[0])
+            res = "TIE" if c == o else ("WIN" if (c > o) == (t["signal"] == "CALL") else "LOSS")
+            if res != "TIE":
+                win = res == "WIN"; shadow_tracker.record(t["pair"], win)
+                self.shadow_day.setdefault(t["pair"], [0, 0])[0 if win else 1] += 1
+                ps = self.shadow_payout.setdefault(t["pair"], [0.0, 0]); ps[0] += t["payout"]; ps[1] += 1
+            self.tg.admin(f"👻 Shadow result {t['pair']}: {res} ({t['signal']} {t['entry_at']:%H:%M}, {o:.5f} → {c:.5f})")
+            self.log_shadow(t, o, c, res)
+            try: self.save_shadow()
+            except Exception as e: log.warning("shadow save: %s", e)
+        self.shadow_open = keep
+
+    def log_shadow(self, t, o, c, res):
+        import csv
+        new = not os.path.exists(C.SHADOW_LOG)
+        with open(C.SHADOW_LOG, "a", newline="") as f:
+            w = csv.writer(f)
+            if new: w.writerow(["entry_at", "pair", "dir", "confidence", "regime", "payout", "open", "close", "result"])
+            w.writerow([f"{t['entry_at']:%Y-%m-%d %H:%M}", t["pair"], t["signal"], t["confidence"], t["regime"], t["payout"], o, c, res])
+
+    def shadow_lines(self, day_only=False):
+        rows, tw, tl, ps, pn = [], 0, 0, 0.0, 0
+        pairs = sorted(set(self.shadow_day) if day_only else set(shadow_tracker.total))
+        for p in pairs:
+            w, l = (self.shadow_day.get(p, [0, 0]) if day_only else shadow_tracker.total[p])
+            if not (w or l): continue
+            s_, n_ = self.shadow_payout.get(p, [C.DEFAULT_PAYOUT, 1]); pay = s_/n_ if n_ else C.DEFAULT_PAYOUT
+            be = breakeven(pay); wr = w/(w+l); tw += w; tl += l; ps += pay*(w+l); pn += w+l
+            rows.append(f"  {p}: {w}W/{l}L · {wr:.0%} vs BE {be:.1%} {'✅' if wr > be else '❌'}")
+        if not rows: return ["  no resolved shadow trades yet"]
+        be = breakeven(ps/pn); wr = tw/(tw+tl)
+        rows.append(f"  Total {tw}W/{tl}L · {wr:.0%} vs BE {be:.1%} {'✅ above' if wr > be else '❌ below'} breakeven")
+        return rows
+
+    def shadow_report(self):
+        if not C.SHADOW_RELAXED: return "👻 Shadow (relaxed) is OFF (set SHADOW_RELAXED=1 in Railway)."
+        return "\n".join(["👻 Shadow (relaxed) — admin only, never posted", "Today:"] + self.shadow_lines(True)
+                         + ["All time:"] + self.shadow_lines(False) + [f"Open shadow trades: {len(self.shadow_open)}"])
+
     # ---- admin commands ----
     def command(self, cmd):
         if cmd == "/pause": self.manual_pause = True; self.tg.admin("⏸ Paused by admin")
         elif cmd == "/resume": self.manual_pause = False; self.budget_pause = False; self.tg.admin("▶️ Resumed")
         elif cmd == "/status": self.tg.admin(self.status())
         elif cmd in ("/test", "/testcard"): self.test_card()
+        elif cmd == "/shadow": self.tg.admin(self.shadow_report())
         elif cmd == "/help":
             self.tg.admin("Admin commands:\n/pause: stop sending signals\n/resume: resume (also clears budget pause)\n"
-                          "/status: pause state, per-pair W/L, compounding eligibility\n/test (/testcard): post one sample card to the group\n/help: this list")
+                          "/status: pause state, per-pair W/L, compounding eligibility\n/test (/testcard): post one sample card to the group\n"
+                          "/shadow: relaxed shadow stats (W/L, win rate vs breakeven; never posted)\n/help: this list")
 
     def test_card(self):
         """Post a sample card with the real card builder + chart. Touches no stats, cooldowns, trades.csv, precheck or results."""
@@ -257,7 +359,7 @@ class Bot:
         if not sent: self.tg.group(cap)
         self.tg.admin(f"🧪 Test card posted (chart from {src} candles)")
     def status(self):
-        lines = [f"Paused: manual={self.manual_pause} budget={self.budget_pause} session={self.in_session()}"]
+        lines = [f"Running: {not (self.manual_pause or self.budget_pause or not self.in_session())} | paused by admin: {self.manual_pause} | paused for budget: {self.budget_pause} | inside trading hours: {self.in_session()}"]
         for p in C.PAIRS:
             wr = tracker.winrate(p); w, l = tracker.total[p]
             lines.append(f"{p}: {w}W/{l}L" + (f" rolling {wr:.0%}" if wr is not None else ""))
@@ -324,6 +426,13 @@ class Bot:
 
     # ---- one minute ----
     def tick(self):
+        try: self._tick()
+        finally:
+            if C.SHADOW_RELAXED:
+                try: self.shadow_resolve()
+                except Exception: log.exception("shadow resolve failed")
+
+    def _tick(self):
         now = self.d.now()
         self.maybe_daily_summary()
         if hasattr(self.d, "admin_messages"):
@@ -351,7 +460,9 @@ class Bot:
             if df is None or len(df) < C.MIN_BARS or not open_: continue
             if now - (df.index[-1] + pd.Timedelta("60s")) > pd.Timedelta("90s") + (pd.Timedelta("60s") if C.SCAN_MODE == "early52" else pd.Timedelta(0)):
                 log.info("%s stale data, skip", pair); continue
-            s = analyze(df, pair, payout=payout, gaps=gaps)
+            x = compute(df)
+            s = analyze(df, pair, payout=payout, gaps=gaps, x=x)
+            if C.SHADOW_RELAXED and not s["signal"]: self.shadow_eval(df, x, pair, payout, gaps, now)
             if s["signal"]: s["_df"] = df
             if s["signal"] and (best is None or s["confidence"] > best["confidence"]): best = s
         if not best:
@@ -519,6 +630,11 @@ class Bot:
     def maybe_daily_summary(self, force=False):
         today = self.d.now().date()
         if self.day_date == today and not force: return
+        shadow_sec = ([f"  👻 Shadow (relaxed) — not posted:"] + ["  " + l for l in self.shadow_lines(True)]) \
+            if C.SHADOW_RELAXED and any(sum(v) for v in self.shadow_day.values()) else []
+        self.shadow_day = {}
+        if shadow_sec and not any(sum(v) for v in self.day.values()):
+            self.tg.admin("\n".join([f"📊 Daily summary {self.day_date} (UTC): no real trades"] + shadow_sec))
         if any(sum(v) for v in self.day.values()):
             lines = [f"📊 Daily summary {self.day_date} (UTC)"]
             tw = tl = tc = 0
@@ -533,7 +649,7 @@ class Bot:
             if self.rotated_out: lines.append(f"  Rotated out today: {sorted(self.rotated_out)}")
             lines.append(f"  Compounding active: {self.compound_active}")
             lines.append("  Eligibility: " + self.eligibility_line())
-            self.tg.admin("\n".join(lines))
+            self.tg.admin("\n".join(lines + shadow_sec))
         self.day = {p: [0, 0, 0] for p in self.all_pairs if hasattr(self, "all_pairs")} if hasattr(self, "all_pairs") else {p: [0, 0, 0] for p in C.PAIRS}; self.day_date = today
         self.kind_day = {"confirmed": [0, 0], "switched": [0, 0]}
         self.compound_active = list(C.COMPOUND_PAIRS); self.lost_ladders = {}; self.rotated_out = set(); self.ladder = {}
@@ -565,7 +681,12 @@ def main():
         data = StreamAdapter(rest=rest, stop=STOP)
     else: data = OTChartsAdapter()
     bot = Bot(data)
-    signal.signal(signal.SIGTERM, lambda *_: STOP.set()); signal.signal(signal.SIGINT, lambda *_: STOP.set())
+    def _shutdown(*_):
+        STOP.set()   # Railway sends SIGTERM on restart/redeploy: release the stream slot right away
+        try:
+            if hasattr(bot.d, "close"): bot.d.close()
+        except Exception as e: log.warning("stream close on SIGTERM: %s", e)
+    signal.signal(signal.SIGTERM, _shutdown); signal.signal(signal.SIGINT, _shutdown)
     log.info("Started: source=%s book=%s pairs=%d telegram=%s", C.DATA_SOURCE, C.BROKER_BOOK, len(C.PAIRS), C.TELEGRAM_ENABLED)
     if bot.tg.on:
         threading.Thread(target=bot.tg.poll_commands, args=(bot.command,), daemon=True).start()
@@ -607,7 +728,10 @@ def main():
         try: bot.tick()
         except Exception: log.exception("tick failed (continuing)")
     if hasattr(bot.d, "close"): bot.d.close()
-    bot.maybe_daily_summary(force=True); bot.save_stats(); log.info("Stopped cleanly. %s", bot.status().replace("\n", " | "))
+    bot.maybe_daily_summary(force=True); bot.save_stats()
+    try: bot.save_shadow()
+    except Exception as e: log.warning("shadow save: %s", e)
+    log.info("Stopped cleanly. %s", bot.status().replace("\n", " | "))
 
 if __name__ == "__main__":
     main()

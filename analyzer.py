@@ -173,7 +173,7 @@ def analyze(df, pair, payout=None, x=None, i=None, gaps=0, use_gate=True):
     W = C.W_TREND if reg == "trend" else C.W_RANGE
     votes = {"trend": v_trend(x, i) if W["trend"] else (0, ""), "momentum": v_momentum(x, i, reg),
              "location": v_location(x, i, reg), "candle": v_candle(x, i, reg)}
-    if len({v for v, _ in votes.values() if v}) > 1: return {"signal": None, "reject": "conflicting votes"}
+    if not C.ALLOW_CONFLICT and len({v for v, _ in votes.values() if v}) > 1: return {"signal": None, "reject": "conflicting votes"}
     score = sum(W[k]*v for k, (v, _) in votes.items()); mx = sum(W.values()); conf = abs(score)/mx
     if conf < C.MIN_CONF: return {"signal": None, "reject": "score below threshold", "score": score}
     direction = "CALL" if score > 0 else "PUT"
@@ -185,6 +185,24 @@ def analyze(df, pair, payout=None, x=None, i=None, gaps=0, use_gate=True):
             "max_score": mx, "confidence": round(conf*100), "reasons": [t for v, t in votes.values() if v], "votes": {k: [v, t] for k, (v, t) in votes.items()},
             "support": float(r.sup), "resistance": float(r.res), "atr": float(r.atr), "ema9": float(r.ema_f),
             "sig_mid": float((r.high + r.low)/2), "sig_close": float(r.close), "adx": round(float(r.adx), 1), "er": round(float(r.er), 2), "payout": p, "breakeven": round(breakeven(p), 4)}
+
+# ---------- relaxed shadow engine ----------
+from contextlib import contextmanager
+@contextmanager
+def _overrides(ov):
+    old = {k: getattr(C, k) for k in ov}
+    try:
+        for k, v in ov.items(): setattr(C, k, v)
+        yield
+    finally:
+        for k, v in old.items(): setattr(C, k, v)
+
+shadow_tracker = PairTracker()   # separate from the real tracker; never used for gating/compounding
+
+def analyze_relaxed(df, pair, payout=None, gaps=0, x=None):
+    """Same engine with C.SHADOW_OVERRIDES. Keeps MIN_PAYOUT and gap rejection; the real pair gate is not applied."""
+    with _overrides(C.SHADOW_OVERRIDES):
+        return analyze(df, pair, payout=payout, gaps=gaps, x=x, use_gate=False)
 
 # ---------- backtest ----------
 def load_csv(path, pair=None):
