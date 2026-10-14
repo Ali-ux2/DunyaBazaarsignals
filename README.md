@@ -27,6 +27,8 @@ The bot must be an admin of the channel to post. Deploy as a worker (Procfile `w
 ## Admin commands (from TELEGRAM_ADMIN_ID only)
 `/pause`, `/resume`, `/status`, `/shadow` (relaxed shadow stats: per-pair W/L, win rate vs breakeven), `/test` (alias `/testcard`: posts one sample card to the group, headed `🧪 TEST CARD — NOT A LIVE SIGNAL`; no stats/trades/cooldowns touched), `/help`. Stop the Railway service between sessions, or use `/pause` / `SESSIONS_UTC`.
 
+
+Filters were eased slightly (midway toward the shadow thresholds) for more group signals; payout floor, gap rejection and :57 never-skip are unchanged.
 ## Loop
 Every minute at :02 UTC (the closed candle, not :52 on an unfinished one): fetch `/v1/candles` per pair
 (300 bars at first, then 60), drop the forming candle (Quotex bars are already UTC; only Pocket Option `otc` gets a −2h shift), then skip pairs that are
@@ -144,12 +146,12 @@ cooldowns, compounding, the pair gate or real stats. They are stored separately 
 
 | Setting | Strict | Relaxed shadow |
 |---|---|---|
-| Min confluence (`MIN_CONF`) | 0.70 | 0.55 |
-| ADX trend / range | 25 / 18 | 21 / 20 |
-| Efficiency ratio for trend | 0.35 | 0.25 |
-| ATR percentile window | 20–95 | 10–98 |
-| Min S/R range | 3.0 ATR | 2.0 ATR |
-| Strong-candle body | 0.60 | 0.50 |
+| Min confluence (`MIN_CONF`) | 0.62 | 0.55 |
+| ADX trend / range | 23 / 19 | 21 / 20 |
+| Efficiency ratio for trend | 0.30 | 0.25 |
+| ATR percentile window | 15–96 | 10–98 |
+| Min S/R range | 2.5 ATR | 2.0 ATR |
+| Strong-candle body | 0.55 | 0.50 |
 | Chop reject | 4 of 5 bars | 5 of 5 bars |
 | Conflicting votes | reject | allowed, net score decides |
 | Overlap rule | log/require | ignored |

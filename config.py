@@ -97,15 +97,15 @@ EMA_FAST, EMA_SLOW, EMA_SLOPE_LOOKBACK = 9, 21, 3
 RSI_LEN = 7
 STOCH_K, STOCH_SMOOTH, STOCH_D = 5, 3, 3
 SR_LEN, BB_LEN, BB_STD = 20, 20, 2.0
-ATR_LEN, ATR_PCTL_LOOKBACK, ATR_PCTL_MIN, ATR_PCTL_MAX = 14, 240, 20, 95
-ADX_LEN, ADX_TREND, ADX_RANGE = 14, 25, 18
-ER_LEN, ER_TREND = 10, 0.35
+ATR_LEN, ATR_PCTL_LOOKBACK, ATR_PCTL_MIN, ATR_PCTL_MAX = 14, 240, 15, 96
+ADX_LEN, ADX_TREND, ADX_RANGE = 14, 23, 19
+ER_LEN, ER_TREND = 10, 0.30
 CHOP_PCT, CHOP_BARS, CHOP_WINDOW = 0.0008, 4, 5
-SR_MIN_RANGE_ATR = 3.0
-BODY_MIN, WICK_MAX = 0.60, 0.30
+SR_MIN_RANGE_ATR = 2.5
+BODY_MIN, WICK_MAX = 0.55, 0.30
 W_TREND = dict(trend=2.0, momentum=1.5, location=1.0, candle=1.0)
 W_RANGE = dict(trend=0.0, momentum=1.0, location=2.0, candle=1.0)
-MIN_CONF = 0.70
+MIN_CONF = 0.62
 STREAM_WARMUP_BARS = max(30, min(50, int(_env("STREAM_WARMUP_BARS", default="50"))))  # /v1/candles per pair on every stream open
 MIN_BARS = int(_env("MIN_BARS", default="50" if MODE == "stream" or DATA_SOURCE == "mockstream" else "260"))
 POLL_MIN_BARS = MIN_BARS
@@ -123,14 +123,14 @@ SHADOW_LOG = os.path.join(STATE_DIR, "shadow_trades.csv")
 SHADOW_MAX_WAIT_MIN = 20     # give up resolving a shadow trade if its candle never shows up in already-fetched data
 # Overrides applied ONLY inside the shadow evaluation. Payout floor (MIN_PAYOUT) and gap rejection are NOT relaxed.
 SHADOW_OVERRIDES = dict(
-    MIN_CONF=0.55,           # strict 0.70
-    ADX_TREND=21,            # strict 25
-    ADX_RANGE=20,            # strict 18 (narrower "unclear" band)
-    ER_TREND=0.25,           # strict 0.35
-    ATR_PCTL_MIN=10,         # strict 20
-    ATR_PCTL_MAX=98,         # strict 95
-    SR_MIN_RANGE_ATR=2.0,    # strict 3.0
-    BODY_MIN=0.50,           # strict 0.60
+    MIN_CONF=0.55,           # strict 0.62
+    ADX_TREND=21,            # strict 23
+    ADX_RANGE=20,            # strict 19 (narrower "unclear" band)
+    ER_TREND=0.25,           # strict 0.30
+    ATR_PCTL_MIN=10,         # strict 15
+    ATR_PCTL_MAX=98,         # strict 96
+    SR_MIN_RANGE_ATR=2.0,    # strict 2.5
+    BODY_MIN=0.50,           # strict 0.55
     CHOP_BARS=5,             # strict 4 (chop must be 5/5 bars to reject)
     ALLOW_CONFLICT=True,     # strict False: net weighted score decides
     OVERLAP_MODE="off",      # strict log/require: ignored
