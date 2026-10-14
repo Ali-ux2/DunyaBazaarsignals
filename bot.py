@@ -11,8 +11,8 @@ from config import (
 from analyzer import S3Analyzer, TOTAL_VOTES
 from charting import generate_candle_chart
 from otcharts import Client
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import TelegramError
 
 logging.basicConfig(
@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 otc = Client(api_key=OTCHARTS_API_KEY)
 bot = Bot(token=BOT_TOKEN)
 
-# Reassigned after verification
 analyzer = None
 VALID_PAIRS = []
 
@@ -55,7 +54,19 @@ async def send_admin_feedback(text):
         logger.error(f"Admin feedback error: {e}")
 
 
-async def send_signal_with_chart(pair, direction, strength, entry_time_str, vote_count):
+# ---------------- Inline Keyboard Menu ----------------
+def main_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📊 Live Status", callback_data="feed"),
+         InlineKeyboardButton("▶️ Resume", callback_data="resume")],
+        [InlineKeyboardButton("⏸️ Pause", callback_data="pause"),
+         InlineKeyboardButton("🧪 Test Card", callback_data="testcard")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_signal_with_chart(pair, direction, strength, entry_time_str, vote_count, support, resistance):
     try:
         bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=50)
         count_request()
@@ -87,7 +98,10 @@ async def send_signal_with_chart(pair, direction, strength, entry_time_str, vote
             f"💰 Payout     : `{payout}%`\n\n"
             f"----------\n\n"
             f"✨ Confidence : `{confidence}%`\n"
-            f"🔒 Confluence : `{vote_count}/{TOTAL_VOTES} votes`\n\n"
+            f"🔒 Confluence : `{vote_count}/{TOTAL_VOTES} votes`\n"
+            f"🛡️ Support    : `{support:.5f}`\n"
+            f"🚧 Resistance : `{resistance:.5f}`\n\n"
+            f"⚠️ *MTG : STEP 1 IF LOSS*\n\n"
             f"----------\n\n"
             f"💬 CONTACT : @DBSdesk"
         )
@@ -123,7 +137,6 @@ async def send_result_message(result_text):
 
 
 async def verify_pairs():
-    """Test each pair; keep only ones that return candles."""
     global VALID_PAIRS
     valid = []
     logger.info(f"Verifying {len(PAIRS)} pairs...")
@@ -140,7 +153,7 @@ async def verify_pairs():
             logger.warning(f"❌ {pair} — {e}")
         await asyncio.sleep(0.3)
     VALID_PAIRS = valid
-    logger.info(f"Verified {len(VALID_PAIRS)}/{len(PAIRS)} pairs: {', '.join(VALID_PAIRS)}")
+    logger.info(f"Verified {len(VALID_PAIRS)}/{len(PAIRS)} pairs.")
     return valid
 
 
@@ -148,34 +161,25 @@ async def run_sniper_loop():
     global analyzer, next_scan_allowed
 
     logger.info("Starting DunyaBazaar engine...")
-
-    # 1. Verify pairs first
     valid = await verify_pairs()
     if not valid:
-        logger.error("No valid pairs! Bot cannot run.")
-        await send_admin_feedback("🚨 ERROR: No valid pairs found on Quotex.")
+        await send_admin_feedback("🚨 ERROR: No valid pairs found.")
         return
 
-    # 2. Initialize analyzer with valid pairs only
     analyzer = S3Analyzer(pairs=valid)
 
-    # 3. Warmup
     for pair in VALID_PAIRS:
         try:
-            bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME,
-                               limit=CANDLES_FOR_WARMUP)
+            bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=CANDLES_FOR_WARMUP)
             count_request()
             for bar in bars:
                 analyzer.analyze(pair, bar.close, bar.high, bar.low, bar.open)
-            logger.info(f"Warmed up {pair} with {len(bars)} candles")
         except Exception as e:
             logger.error(f"Warmup failed for {pair}: {e}")
         await asyncio.sleep(0.3)
 
-    logger.info("Warmup complete. Entering main loop.")
-    await send_admin_feedback(
-        f"✅ Bot started. Valid pairs: {', '.join(VALID_PAIRS)} ({len(VALID_PAIRS)}/{len(PAIRS)})"
-    )
+    logger.info("Warmup complete.")
+    await send_admin_feedback(f"✅ Bot started. Valid pairs: {', '.join(VALID_PAIRS)}")
 
     while True:
         if not IS_BOT_ACTIVE:
@@ -203,13 +207,11 @@ async def run_sniper_loop():
                 try:
                     bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=1)
                     count_request()
-                    if not bars:
-                        continue
+                    if not bars: continue
                     true_entry = bars[-1].open
                     pending_signals[pair]['entry_price'] = true_entry
                     active_trades[pair] = pending_signals.pop(pair)
                     analyzer.last_signal[pair] = active_trades[pair]['direction']
-                    logger.info(f"Registered entry {pair} @ {true_entry:.5f}")
                 except Exception as e:
                     logger.error(f"Entry capture error {pair}: {e}")
 
@@ -219,8 +221,7 @@ async def run_sniper_loop():
                     if now >= trade['expiry_time'] and now < trade['expiry_time'] + timedelta(seconds=10):
                         bars = otc.candles("quotex", pair, tf=CANDLE_TIMEFRAME, limit=1)
                         count_request()
-                        if not bars:
-                            continue
+                        if not bars: continue
                         close_price = bars[-1].close
                         entry_price = trade['entry_price']
                         direction = trade['direction']
@@ -249,8 +250,7 @@ async def run_sniper_loop():
                 if pair in pending_signals or pair in active_trades:
                     continue
                 expl = analyzer.latest_explanation(pair)
-                if expl is None:
-                    continue
+                if expl is None: continue
                 score = expl["score"]
                 if abs(score) >= MIN_SCORE:
                     direction = "CALL" if score > 0 else "PUT"
@@ -260,6 +260,8 @@ async def run_sniper_loop():
                         "direction": direction,
                         "confidence": confidence_pct,
                         "votes": abs(score),
+                        "support": expl.get("support", 0.0),
+                        "resistance": expl.get("resistance", 0.0),
                     })
 
             if triggered:
@@ -272,7 +274,7 @@ async def run_sniper_loop():
 
                 sent_ok = await send_signal_with_chart(
                     best["pair"], best["direction"], best["confidence"],
-                    entry_str, best["votes"]
+                    entry_str, best["votes"], best["support"], best["resistance"]
                 )
 
                 if sent_ok:
@@ -281,10 +283,6 @@ async def run_sniper_loop():
                         'expiry_time': expiry_time,
                     }
                     next_scan_allowed = now + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
-                    logger.info(
-                        f"Signal sent ({best['pair']}, {best['votes']}/{TOTAL_VOTES}). "
-                        f"Next scan at {next_scan_allowed.strftime('%H:%M:%S')}"
-                    )
                 else:
                     logger.warning("Signal send failed.")
             else:
@@ -293,49 +291,43 @@ async def run_sniper_loop():
         await asyncio.sleep(1)
 
 
-# ---------------- Commands ----------------
+# ---------------- Command Handlers ----------------
 def is_admin(update):
     return str(update.effective_user.id) == str(ADMIN_ID)
-
-
-COMMAND_MENU = (
-    "📋 *DunyaBazaar Bot — Commands*\n\n"
-    "▶️ /start — Activate + show menu\n"
-    "⏸️ /pause — Pause scanning\n"
-    "▶️ /resume — Resume scanning\n"
-    "📊 /feed — Bot status\n"
-    "🧪 /testcard — Test signal\n"
-    "❓ /help — Show this menu\n"
-)
-
 
 async def cmd_start(update, context):
     if not is_admin(update): return
     global IS_BOT_ACTIVE
     IS_BOT_ACTIVE = True
     await update.message.reply_text(
-        "✅ *Bot ACTIVATED.*\n\n" + COMMAND_MENU, parse_mode="Markdown"
+        "✅ *Bot ACTIVATED.*\n\nUse the menu below:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown"
     )
-
 
 async def cmd_help(update, context):
     if not is_admin(update): return
-    await update.message.reply_text(COMMAND_MENU, parse_mode="Markdown")
-
+    await update.message.reply_text(
+        "📋 *Commands*\n"
+        "/start - Activate & Show Menu\n"
+        "/pause - Pause scanning\n"
+        "/resume - Resume scanning\n"
+        "/feed - Bot status\n"
+        "/testcard - Test signal",
+        parse_mode="Markdown"
+    )
 
 async def cmd_pause(update, context):
     if not is_admin(update): return
     global IS_BOT_ACTIVE
     IS_BOT_ACTIVE = False
-    await update.message.reply_text("⏸️ *Bot PAUSED.*")
-
+    await update.message.reply_text("⏸️ *Bot PAUSED.*", parse_mode="Markdown")
 
 async def cmd_resume(update, context):
     if not is_admin(update): return
     global IS_BOT_ACTIVE
     IS_BOT_ACTIVE = True
-    await update.message.reply_text("▶️ *Bot RESUMED.*")
-
+    await update.message.reply_text("▶️ *Bot RESUMED.*", parse_mode="Markdown")
 
 async def cmd_feed(update, context):
     if not is_admin(update): return
@@ -344,46 +336,42 @@ async def cmd_feed(update, context):
         lines = [
             "DunyaBazaar Status",
             f"Engine: {status}",
-            f"Valid pairs: {len(VALID_PAIRS)}/{len(PAIRS)}",
-            f"  {', '.join(VALID_PAIRS) if VALID_PAIRS else 'none yet'}",
+            f"Valid pairs: {len(VALID_PAIRS)}",
             f"MIN_SCORE: {MIN_SCORE} of {TOTAL_VOTES}",
             f"Requests today: {request_count} / 7000",
             f"Next scan: {next_scan_allowed.strftime('%H:%M:%S')}",
-            "",
         ]
-        if pending_signals:
-            lines.append("Pending entry:")
-            for p in pending_signals:
-                lines.append(f"  - {p}")
-        if active_trades:
-            lines.append("Active trades:")
-            for p, t in active_trades.items():
-                lines.append(
-                    f"  - {p} | {t['direction']} | "
-                    f"Entry {t['entry_price']:.5f} | "
-                    f"Exp {t['expiry_time'].strftime('%H:%M')}"
-                )
-        if not pending_signals and not active_trades:
-            lines.append("No active trades.")
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines), reply_markup=main_menu_keyboard())
     except Exception as e:
-        logger.error(f"cmd_feed error: {e}")
-        try:
-            await update.message.reply_text(f"Status unavailable: {e}")
-        except Exception:
-            pass
-
+        await update.message.reply_text(f"Status unavailable: {e}")
 
 async def cmd_testcard(update, context):
     if not is_admin(update): return
     pair = VALID_PAIRS[0] if VALID_PAIRS else "USDINR_otc"
     try:
-        await send_signal_with_chart(pair, "PUT", 67, "17:59", 4)
+        await send_signal_with_chart(pair, "PUT", 67, "17:59", 4, 0.0, 0.0)
         await update.message.reply_text("✅ Test card sent.")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
 
+# ---------------- Callback Handler ----------------
+async def button_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
 
+    if data == "feed":
+        await cmd_feed(update, context)
+    elif data == "pause":
+        await cmd_pause(update, context)
+    elif data == "resume":
+        await cmd_resume(update, context)
+    elif data == "testcard":
+        await cmd_testcard(update, context)
+    elif data == "help":
+        await cmd_help(update, context)
+
+# ---------------- Main ----------------
 async def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -393,6 +381,7 @@ async def main():
     application.add_handler(CommandHandler("resume", cmd_resume))
     application.add_handler(CommandHandler("feed", cmd_feed))
     application.add_handler(CommandHandler("testcard", cmd_testcard))
+    application.add_handler(CallbackQueryHandler(button_callback))
 
     asyncio.create_task(run_sniper_loop())
 
@@ -402,7 +391,7 @@ async def main():
 
     try:
         await application.bot.set_my_commands([
-            ("start", "Activate bot & show commands"),
+            ("start", "Activate bot & show menu"),
             ("pause", "Pause signal scanning"),
             ("resume", "Resume signal scanning"),
             ("feed", "Show bot status"),
@@ -414,7 +403,6 @@ async def main():
 
     await application.updater.start_polling()
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     asyncio.run(main())

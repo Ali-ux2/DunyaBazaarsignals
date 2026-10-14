@@ -9,7 +9,7 @@ CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
 OTCHARTS_API_KEY = os.environ.get("OTCHARTS_API_KEY")
 ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID")
 
-# --- Pairs to TRY (bot verifies each at startup, skips broken ones) ---
+# --- Pairs (bot verifies each at startup, skips broken ones) ---
 PAIRS = [
     "USDINR_otc",
     "USDMXN_otc",
@@ -22,12 +22,13 @@ PAIRS = [
     "USDEGP_otc",
     "USDNGN_otc",
     "USDDZD_otc",
-    "USDBRL_otc",   # may not exist — will be auto-skipped if so
+    "USDBRL_otc",
 ]
 
 # --- Confluence ---
-MIN_SCORE = 4
+MIN_SCORE = 5   # 5 of 7 votes required
 
+# Vote periods
 EMA_TREND_FAST = 9
 EMA_TREND_SLOW = 21
 EMA_SHORT_FAST = 5
@@ -40,12 +41,15 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
+# Timeframe
 CANDLE_TIMEFRAME = 60
 TRADE_DURATION_MINUTES = 1
 
+# Cooldowns
 SIGNAL_COOLDOWN_MINUTES = 3
 COOLDOWN_AFTER_RESULT_MINUTES = 2
 
+# Analyzer history
 CANDLES_TO_TRACK = 100
 CANDLES_FOR_WARMUP = 80
 CANDLES_MIN_REQUIRED = 50
