@@ -16,6 +16,7 @@ Files: `analyzer.py` (signal engine + backtest), `config.py` (all settings), `bo
 | `SCAN_MODE` | | `closed` (default: closed candle at :02, entry next :00) or `early52` (old: forming candle at :52, entry next :00) |
 | `PRECHECK_MODE` | | `confirm` (default), `log`, `off` |
 | `PRECHECK_SECOND` | | default `57` |
+| `PAIRS` | | optional comma list, default: all 12 pairs |
 | `STATE_DIR` | | optional; point at a Railway Volume mount so `pair_stats.json` survives redeploys |
 | `DATA_SOURCE`, `REPLAY_CSV`, `TELEGRAM_ENABLED`, `DRY_RUN_MINUTES` | | testing only |
 
@@ -23,7 +24,7 @@ If a required one is missing the bot logs `Missing required env vars: ...` and e
 The bot must be an admin of the channel to post. Deploy as a worker (Procfile `worker: python bot.py`).
 
 ## Admin commands (from TELEGRAM_ADMIN_ID only)
-`/pause`, `/resume`, `/status`. Stop the Railway service between sessions, or use `/pause` / `SESSIONS_UTC`.
+`/pause`, `/resume`, `/status`, `/test` (alias `/testcard`: posts one sample card to the group, headed `🧪 TEST CARD — NOT A LIVE SIGNAL`; no stats/trades/cooldowns touched), `/help`. Stop the Railway service between sessions, or use `/pause` / `SESSIONS_UTC`.
 
 ## Loop
 Every minute at :02 UTC (the closed candle, not :52 on an unfinished one): fetch `/v1/candles` per pair
@@ -110,3 +111,24 @@ Pairs are **never removed**: an unresolved pair is skipped and retried every `RE
 `COMPOUND_MIN_TRADES=30`: a pair may rotate INTO compounding only with ≥ 30 settled trades (cancels and ties excluded) and no
 breakeven gate active. If no pair qualifies, the slot stays empty and this is logged. `/status` and the daily summary list
 `PAIR n/30 eligible|not eligible`. A one-time `🎓 PAIR now eligible for compounding (30 trades, WR x%)` is sent when a pair reaches 30.
+
+# Stream package (otc_bot_stream)
+`MODE=stream` (default here) reads live prices from **one** OTCharts `/v1/stream` connection carrying
+`STREAM_PAIRS` (default `USDINR,USDIDR,USDCOP,USDMXN,USDBRL`; max `STREAM_MAX_INSTRUMENTS`=5 on Lite) and builds M1 candles from ticks.
+`MODE=poll` is the original once-a-minute `/v1/candles` bot. `MODE=auto` polls and switches to the stream when the budget hits 95%.
+
+**Facts from otcharts.com/api.html (14 Oct 2026):**
+- Opening a stream costs **one request**; holding it costs nothing more.
+- Lite allows **1 stream × 5 instruments**.
+- 429 means daily requests are exhausted **or** all streams are in use.
+- The stream sends `connected`, `tick` (`price`, `symbol`, `time` always present), `dropped` and `closed` events, plus a keep-alive comment every 20 s.
+- Not documented: whether an already-open stream keeps running after the quota is used up. Reopening after exhaustion would need a request, so it would likely be refused.
+
+**Behaviour:**
+- **Warm-up:** loads `STATE_DIR/candles/<PAIR>.csv` (last 300 closed candles, saved every minute). Otherwise it fetches `/v1/candles` once per pair if the budget allows (1 request each). Otherwise it builds candles from ticks. Signals start at `MIN_BARS` (60 in stream mode); admin gets `⏳ Warm-up USDINR: 10/60 candles … ✅ Warm-up done`.
+- **:57 precheck:** uses the live forming candle built from ticks, at no request cost.
+- **Payouts:** `/v1/symbols` every 5 min while REST is allowed, cached to `payouts.json`. If no live or cached payout exists, the bot uses `STREAM_FALLBACK_PAYOUT` (0.85) and logs it to admin. Symbol resolutions (including the BRLUSD flip) are cached to `resolutions.json`.
+- **95% budget:** REST calls stop and the stream keeps running (no pause).
+- **Reconnects:** automatic with backoff 2→60 s; 5 min after a 429. A `dropped` event reopens the stream after 3 min. Only one connection is ever held.
+- **Railway:** mount a volume at `STATE_DIR` so candles, payouts and resolutions survive restarts.
+- **Tests:** `python test_stream.py`; dry-run: `DATA_SOURCE=mockstream TELEGRAM_ENABLED=0 DRY_RUN_MINUTES=400 python bot.py`.

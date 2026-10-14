@@ -1,0 +1,280 @@
+"""OTCharts /v1/stream data source: one SSE connection carrying up to STREAM_MAX_INSTRUMENTS symbols.
+Builds M1 candles from ticks in memory, persists the last 300 per pair to STATE_DIR, caches payouts/resolutions.
+
+Verified from https://otcharts.com/api.html (14 Oct 2026):
+- Opening a stream counts as ONE request against the daily total; holding it costs nothing further.
+- Lite: 1 stream at once, up to 5 instruments (Quotex/Pocket Option carry many per stream).
+- SSE events: `connected` {"symbols":[...]}, `tick` {"price","symbol","time",...}, `dropped` {"dropped":[...]},
+  `closed` {"closed":[...]}; a comment line every 20 s when quiet. 429 = daily requests exhausted OR all streams in use.
+- Only price and time are on every tick. Quotex times are UTC; Pocket Option ('otc') is UTC+2.
+NOT documented: whether an already-open stream survives once the daily quota is exhausted. Reopening after exhaustion
+should be refused (it costs a request). So this client never closes a healthy stream on purpose."""
+from __future__ import annotations
+import json, logging, math, os, threading, time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+import numpy as np, pandas as pd, requests
+import config as C
+log = logging.getLogger("bot")
+UTC = timezone.utc
+
+# ---------------- SSE parsing ----------------
+def parse_sse(lines):
+    """Yield (event, data_dict) from an iterable of text lines (comments/keep-alives skipped)."""
+    ev, data = None, []
+    for raw in lines:
+        line = raw.decode() if isinstance(raw, bytes) else raw
+        line = line.rstrip("\r\n")
+        if line == "":
+            if data:
+                try: yield (ev or "message"), json.loads("\n".join(data))
+                except json.JSONDecodeError: log.warning("bad SSE data: %s", data[:1])
+            ev, data = None, []; continue
+        if line.startswith(":"): continue           # keep-alive comment (every 20 s when quiet)
+        k, _, v = line.partition(":"); v = v[1:] if v.startswith(" ") else v
+        if k == "event": ev = v
+        elif k == "data": data.append(v)
+    if data:
+        try: yield (ev or "message"), json.loads("\n".join(data))
+        except json.JSONDecodeError: pass
+
+# ---------------- candles from ticks ----------------
+class CandleBook:
+    def __init__(self): self.bars = {}; self.last_tick = None
+    def on_tick(self, t: float, price: float):
+        m = int(t // 60) * 60; b = self.bars.get(m)
+        if b is None: self.bars[m] = [price, price, price, price]
+        else: b[1] = max(b[1], price); b[2] = min(b[2], price); b[3] = price
+        self.last_tick = t
+    def load(self, df: pd.DataFrame, overwrite=False):
+        """Merge candles, de-duplicated by minute. overwrite=True lets authoritative REST bars replace tick-built ones."""
+        n = 0
+        for ts, r in df.iterrows():
+            m = int(ts.timestamp())
+            if overwrite or m not in self.bars: self.bars[m] = [r.open, r.high, r.low, r.close]; n += 1
+        return n
+    def df(self, n=1500):
+        if not self.bars: return None
+        ks = sorted(self.bars)[-n:]
+        idx = pd.to_datetime(ks, unit="s", utc=True)
+        return pd.DataFrame([self.bars[k] for k in ks], index=idx, columns=["open", "high", "low", "close"])
+    def trim(self, keep=2000):
+        if len(self.bars) > keep:
+            for k in sorted(self.bars)[:-keep]: del self.bars[k]
+
+# ---------------- live SSE client ----------------
+class SSEStream(threading.Thread):
+    """Single held connection with auto-reconnect + backoff. on_event(event, data)."""
+    def __init__(self, venue, symbols, on_event, stop: threading.Event):
+        super().__init__(daemon=True); self.venue, self.symbols, self.on_event, self.stop = venue, symbols, on_event, stop
+        self.connected = False; self.reopen = threading.Event(); self.connected_once = False; self.on_reconnect = None
+    def run(self):
+        backoff = 2
+        while not self.stop.is_set():
+            try:
+                with requests.get(f"{C.OTCHARTS_BASE}/v1/stream", stream=True, timeout=(10, 75),
+                                  params={"venue": self.venue, "symbol": ",".join(self.symbols)},
+                                  headers={"Authorization": f"Bearer {C.OTCHARTS_API_KEY}", "User-Agent": C.USER_AGENT,
+                                           "Accept": "text/event-stream"}) as r:
+                    if r.status_code == 429:
+                        self.on_event("error", {"status": 429, "body": r.text[:200]}); wait = C.STREAM_429_BACKOFF_SEC
+                        log.warning("stream 429 (quota exhausted or stream in use); retry in %ss", wait); self.stop.wait(wait); continue
+                    if r.status_code != 200:
+                        self.on_event("error", {"status": r.status_code, "body": r.text[:200]}); raise RuntimeError(f"HTTP {r.status_code}")
+                    if r.headers.get("x-otc-dropped"): log.warning("stream dropped header: %s", r.headers["x-otc-dropped"])
+                    backoff = 2
+                    if self.connected_once and self.on_reconnect: self.on_reconnect()
+                    self.connected = True; self.connected_once = True
+                    for ev, data in parse_sse(r.iter_lines(decode_unicode=True)):
+                        self.on_event(ev, data)
+                        if self.stop.is_set() or self.reopen.is_set(): break
+                    self.reopen.clear()
+            except Exception as e:
+                log.warning("stream disconnected: %s", e)
+            self.connected = False
+            if self.stop.is_set(): break
+            log.info("stream reconnect in %ss", backoff); self.stop.wait(backoff); backoff = min(backoff * 2, 60)
+
+# ---------------- mock tick source (tests / dry-run) ----------------
+class MockTickSource:
+    """Deterministic random-walk ticks every TICK_SEC seconds for each symbol; drives a simulated clock."""
+    def __init__(self, symbols, start: datetime, seed=7, tick_sec=5, bases=None):
+        self.symbols, self.t, self.tick_sec = symbols, start, tick_sec
+        self.g = np.random.default_rng(seed); self.p = {s: (bases or {}).get(s, 10 + 7*i) for i, s in enumerate(symbols)}
+        self.vol = {s: 0.00012 for s in symbols}; self.listeners = []
+    def connect(self, on_event, symbols=None):
+        self.listeners.append(on_event); on_event("connected", {"symbols": list(symbols or self.symbols)})
+    def disconnect(self, on_event):
+        if on_event in self.listeners: self.listeners.remove(on_event)
+    def on_event(self, ev, data):
+        for f in list(self.listeners): f(ev, data)
+    def advance_to(self, target: datetime):
+        while self.t + timedelta(seconds=self.tick_sec) <= target:
+            self.t += timedelta(seconds=self.tick_sec)
+            for s in self.symbols:
+                self.vol[s] *= math.exp(self.g.normal(0, 0.01)); self.vol[s] = min(max(self.vol[s], 0.00005), 0.0004)
+                self.p[s] *= math.exp(self.g.normal(0, 1) * self.vol[s] / math.sqrt(60 / self.tick_sec) * 1.0)
+                self.on_event("tick", {"symbol": s, "price": round(self.p[s], 6), "time": self.t.timestamp()})
+        self.t = max(self.t, target)
+    def now(self): return self.t
+
+# ---------------- adapter used by the bot ----------------
+class StreamAdapter:
+    default_mock = None   # tests: inject a MockTickSource for auto-mode switches
+    def __init__(self, rest=None, mock: MockTickSource | None = None, stop: threading.Event | None = None):
+        mock = mock or StreamAdapter.default_mock
+        self.rest, self.mock = rest, mock; self._stop = stop or threading.Event()
+        self.rest_allowed = rest is not None
+        self.pairs = list(C.STREAM_PAIRS)[:C.STREAM_MAX_INSTRUMENTS]
+        if len(C.STREAM_PAIRS) > C.STREAM_MAX_INSTRUMENTS:
+            log.warning("STREAM_PAIRS has %d pairs; plan stream carries %d. Using %s", len(C.STREAM_PAIRS), C.STREAM_MAX_INSTRUMENTS, self.pairs)
+        os.makedirs(C.CANDLE_DIR, exist_ok=True)
+        self.books = {p: CandleBook() for p in self.pairs}
+        self.closed, self.dropped = set(), set()
+        self.res = self._resolutions()
+        self.sym2pair = {self.res[p].symbol: p for p in self.pairs if self.res.get(p) and self.res[p].symbol}
+        self._warm_marks = {p: 0 for p in self.pairs}; self._msgs = []
+        self._load_persisted(); self._rest_warmup()
+        self.payout_cache = self._load_json(C.PAYOUT_CACHE, {}); self.meta_at = 0.0; self.meta = {}
+        syms = [self.res[p].symbol for p in self.pairs if self.res.get(p) and self.res[p].symbol]
+        if mock: mock.connect(self.on_event, syms)
+        else:
+            self.stream = SSEStream(C.BROKER_BOOK, syms, self.on_event, self._stop)
+            self.stream.on_reconnect = self._rest_warmup   # fill the gap left by the disconnect
+            self.stream.start()
+        log.info("Stream adapter: %d instruments on one stream: %s", len(syms), syms)
+
+    # -- resolution (REST if possible, else cached on disk, else default ids) --
+    def _resolutions(self):
+        from resolver import Resolution
+        cached = self._load_json(C.RESOLUTION_CACHE, {})
+        out = {}
+        for p in self.pairs:
+            r = self.rest.res.get(p) if self.rest else None
+            if r and r.symbol: out[p] = r; continue
+            if p in cached:
+                c = cached[p]; out[p] = Resolution(p, c["symbol"], c["book"], c["inverted"], c.get("variant"), ["cache"])
+                log.warning("%s -> using cached resolution %s (catalogue unavailable)", p, c["symbol"])
+            else:
+                out[p] = Resolution(p, C.symbol_for(p), C.BROKER_BOOK, False, 0, ["default"])
+                log.warning("%s -> catalogue unavailable and no cache; assuming %s", p, out[p].symbol)
+        self._save_json(C.RESOLUTION_CACHE, {p: {"symbol": r.symbol, "book": r.book, "inverted": r.inverted, "variant": r.variant}
+                                            for p, r in out.items() if r.symbol})
+        return out
+
+    # -- persistence --
+    def _load_json(self, path, default):
+        try:
+            with open(path) as f: return json.load(f)
+        except Exception: return default
+    def _save_json(self, path, obj):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f: json.dump(obj, f)
+        os.replace(tmp, path)
+    def _load_persisted(self):
+        for p in self.pairs:
+            f = os.path.join(C.CANDLE_DIR, f"{p}.csv")
+            if os.path.exists(f):
+                df = pd.read_csv(f, index_col=0, parse_dates=True); df.index = pd.to_datetime(df.index, utc=True)
+                self.books[p].load(df); log.info("%s: loaded %d persisted candles (last %s)", p, len(df), df.index[-1])
+    def persist(self):
+        for p, b in self.books.items():
+            df = b.df(C.PERSIST_CANDLES + 1)
+            if df is not None: df = df[df.index + pd.Timedelta("60s") <= pd.Timestamp(self.now())].iloc[-C.PERSIST_CANDLES:]
+            if df is not None and len(df): df.to_csv(os.path.join(C.CANDLE_DIR, f"{p}.csv"))
+            b.trim()
+    def _rest_warmup(self):
+        """Instant warm-up on every stream open: /v1/candles limit=STREAM_WARMUP_BARS per pair, merged with saved/in-memory
+        candles. Falls back to disk cache (already loaded), then ticks."""
+        for p in self.pairs:   # free: candles the polling adapter already holds (auto-mode switch)
+            cached = getattr(self.rest, "cache", {}).get(p) if self.rest else None
+            if cached is not None and len(cached): self.books[p].load(cached)
+        for p in self.pairs:
+            got = None
+            if self.rest is not None and hasattr(self.rest, "fetch_candles"):
+                try: got = self.rest.fetch_candles(p, C.STREAM_WARMUP_BARS)
+                except Exception as e: log.warning("%s: warm-up fetch failed (%s)", p, e)
+            if got is not None and len(got):
+                self.books[p].load(got, overwrite=True)
+                msg = f"⚡ Instant warm-up: {p} {len(got)} candles loaded ({len(self.books[p].bars)} in memory)"
+            elif len(self.books[p].bars):
+                msg = f"💾 Warm-up {p}: REST unavailable, using {len(self.books[p].bars)} saved/in-memory candles"
+            else:
+                msg = f"⏳ Warm-up {p}: REST unavailable and no saved candles; building from ticks (need {C.MIN_BARS})"
+            log.info(msg); self._msgs.append(msg)
+            if len(self.books[p].bars) >= C.MIN_BARS: self._warm_marks[p] = C.MIN_BARS
+
+    def close(self):
+        """Close the stream connection (auto mode: back to polling after the daily reset)."""
+        self._stop.set()
+        if self.mock: self.mock.disconnect(self.on_event)
+        log.info("stream closed")
+
+    # -- events --
+    def on_event(self, ev, data):
+        if ev == "tick":
+            p = self.sym2pair.get(data.get("symbol"))
+            if p not in self.books: return
+            if p and data.get("price") is not None:
+                t = float(data["time"]) - 3600 * C.BOOK_UTC_OFFSET_H.get(C.BROKER_BOOK, 0)
+                self.books[p].on_tick(t, float(data["price"]))
+        elif ev == "connected": log.info("stream connected: %s", data.get("symbols"))
+        elif ev == "dropped":
+            self.dropped = {self.sym2pair.get(s, s) for s in data.get("dropped", [])}
+            self._msgs.append(f"⚠️ Stream dropped {sorted(self.dropped)}: {data.get('reason', '')[:120]} (will reopen in {C.STREAM_REOPEN_DROPPED_MIN} min)")
+            if not self.mock:
+                threading.Timer(C.STREAM_REOPEN_DROPPED_MIN * 60, self.stream.reopen.set).start()
+        elif ev == "closed":
+            self.closed = {self.sym2pair.get(s, s) for s in data.get("closed", [])}
+            self._msgs.append(f"⛔ Broker closed {sorted(self.closed)} for trading")
+        elif ev == "error": self._msgs.append(f"⚠️ Stream error {data.get('status')}: {data.get('body', '')[:120]}")
+
+    # -- bot interface --
+    def now(self): return self.mock.now() if self.mock else datetime.now(UTC)
+    def label(self, pair):
+        r = self.res.get(pair); return r.symbol if r and r.symbol else C.symbol_for(pair)
+    def note(self, pair, direction):
+        r = self.res.get(pair)
+        return f" (= {pair} {'PUT' if direction == 'CALL' else 'CALL'})" if r and r.inverted else ""
+    def candles(self, pair, include_forming=False):
+        b = self.books.get(pair)
+        if b is None: return None, 0, False
+        df = b.df()
+        if df is None: return None, 0, pair not in self.closed
+        now = pd.Timestamp(self.now())
+        if not include_forming: df = df[df.index + pd.Timedelta("60s") <= now]
+        recent = df.index[-30:]
+        gaps = int((pd.Series(recent).diff().dropna() > pd.Timedelta("60s")).sum()) if len(recent) > 1 else 0
+        if b.last_tick and now.timestamp() - b.last_tick > C.STREAM_STALE_SEC: gaps = max(gaps, 1)
+        return df, gaps, pair not in self.closed and pair not in self.dropped
+    def pair_meta(self):
+        if self.rest_allowed and time.time() - self.meta_at > C.PAYOUT_REFRESH_SEC:
+            try:
+                m = self.rest.pair_meta(); self.meta_at = time.time()
+                for p, (pay, op) in m.items():
+                    if pay is not None: self.payout_cache[p] = pay
+                self._save_json(C.PAYOUT_CACHE, self.payout_cache)
+            except Exception as e: log.warning("payout refresh failed (%s); using cache", e); self.meta_at = time.time()
+        out = {}
+        for p in self.pairs:
+            pay = self.payout_cache.get(p)
+            if pay is None:
+                pay = C.STREAM_FALLBACK_PAYOUT
+                if p not in getattr(self, "_fb_logged", set()):
+                    self._fb_logged = getattr(self, "_fb_logged", set()) | {p}
+                    self._msgs.append(f"ℹ️ {p}: no live/cached payout; using fallback {pay:.0%}")
+            out[p] = (pay, p not in self.closed)
+        return out
+    def usage(self):
+        if self.rest:
+            try: return self.rest.usage()
+            except Exception as e: log.warning("usage unavailable: %s", e)
+        return {"used": 0, "quota": 0}
+    def admin_messages(self):
+        for p, b in self.books.items():
+            n = len(b.bars); mark = (min(n, C.MIN_BARS) // 10) * 10
+            if n < C.MIN_BARS and mark > self._warm_marks[p]:
+                self._warm_marks[p] = mark; self._msgs.append(f"⏳ Warm-up {p}: {n}/{C.MIN_BARS} candles")
+            elif n >= C.MIN_BARS and self._warm_marks[p] < C.MIN_BARS:
+                self._warm_marks[p] = C.MIN_BARS; self._msgs.append(f"✅ Warm-up done {p}: {n} candles; signals enabled")
+        out, self._msgs = self._msgs, []; return out

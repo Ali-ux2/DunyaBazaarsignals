@@ -35,7 +35,7 @@ def compute(df):
     x["k"] = (100*(x.close-ll)/(hh-ll).replace(0, np.nan)).rolling(C.STOCH_SMOOTH).mean().fillna(50)
     x["d"] = x.k.rolling(C.STOCH_D).mean().fillna(50)
     x["atr"] = atr(x, C.ATR_LEN)
-    x["atr_pctl"] = x.atr.rolling(C.ATR_PCTL_LOOKBACK, min_periods=50).rank(pct=True)*100
+    x["atr_pctl"] = x.atr.rolling(C.ATR_PCTL_LOOKBACK, min_periods=C.ATR_PCTL_MIN_PERIODS).rank(pct=True)*100
     x["adx"] = adx(x, C.ADX_LEN)
     ch = (x.close - x.close.shift(C.ER_LEN)).abs(); vol = x.close.diff().abs().rolling(C.ER_LEN).sum()
     x["er"] = (ch/vol.replace(0, np.nan)).fillna(0)
@@ -125,6 +125,15 @@ def precheck(sig, f_open, price):
     if body < C.PC_SMALL_BODY_ATR*a: return True, "small opposing body"
     return False, "opposing candle, not confirmed"
 
+def precheck_flip_kind(ok, reason):
+    """For PRECHECK_MODE='direction': None = keep the signal direction; else why we SWITCH.
+    momentum  : forming candle strongly opposes (strong body / moved >0.5 ATR against / crossed back) -> follow it
+    reversion : signal-direction move already exhausted (>1.5 ATR) or price hit the S/R target -> fade it
+    Mild opposing candles and an unavailable candle keep the original direction."""
+    if ok or reason in ("opposing candle, not confirmed", "forming candle unavailable"): return None
+    if reason.startswith("exhausted") or reason.startswith("already at S/R"): return "reversion"
+    return "momentum"
+
 # ---------- pair tracker ----------
 class PairTracker:
     def __init__(self): self.res = defaultdict(lambda: deque(maxlen=C.ROLLING_N)); self.total = defaultdict(lambda: [0, 0])
@@ -150,7 +159,7 @@ def analyze(df, pair, payout=None, x=None, i=None, gaps=0, use_gate=True):
     if x is None: x = compute(df)
     if i is None: i = len(x)-1
     p = C.DEFAULT_PAYOUT if payout is None else payout
-    if i < C.MIN_BARS: return {"signal": None, "reject": "not enough history"}
+    if i + 1 < C.MIN_BARS: return {"signal": None, "reject": "not enough history"}
     if p < C.MIN_PAYOUT: return {"signal": None, "reject": f"payout {p:.0%} < min {C.MIN_PAYOUT:.0%}"}
     if gaps > C.MAX_GAP_RUNS: return {"signal": None, "reject": f"feed gaps ({gaps})"}
     r = x.iloc[i]
@@ -208,9 +217,11 @@ def backtest(df, pair="TEST", payout=C.DEFAULT_PAYOUT, use_gate=False, log_path=
         ent, ex = x.open.iloc[e], x.close.iloc[e+E-1]
         win = bool(ex > ent if s["signal"] == "CALL" else ex < ent)
         cancelled = pm == "confirm" and pc_ok is False
+        flipped = pm == "direction" and precheck_flip_kind(pc_ok, pc_why) is not None
+        if flipped: win = bool(ex < ent if s["signal"] == "CALL" else ex > ent) and ex != ent
         if not cancelled: tracker.record(pair, win)
         trades.append({"time": str(x.index[i]), "dir": s["signal"], "regime": s["regime"], "payout": p, "win": win,
-                       "overlap": s.get("overlap"), "precheck_ok": pc_ok, "precheck_reason": pc_why, "cancelled": cancelled})
+                       "overlap": s.get("overlap"), "precheck_ok": pc_ok, "precheck_reason": pc_why, "cancelled": cancelled, "flipped": flipped})
         nxt = max(e + E + C.RESULT_COOLDOWN_MIN, i + C.SIGNAL_COOLDOWN_MIN)
     t = pd.DataFrame(trades); out = {"pair": pair, "bars": n, "scan_mode": sm, "precheck_mode": pm, "raw_signals": len(t)}
     if len(t):
@@ -228,6 +239,8 @@ def backtest(df, pair="TEST", payout=C.DEFAULT_PAYOUT, use_gate=False, log_path=
             out["precheck"] = {"approximate": True, "cancel_rate": round(float((t.precheck_ok == False).mean()), 4),
                                "confirmed": summ(t[t.precheck_ok == True]), "would_cancel": summ(t[t.precheck_ok == False]),
                                "cancel_reasons": t[t.precheck_ok == False].precheck_reason.str.split(":").str[0].str.split(" \\(").str[0].value_counts().to_dict()}
+        if pm == "direction":
+            out["direction_mode"] = {"approximate": True, "confirmed": summ(t[~t.flipped]), "switched": summ(t[t.flipped])}
         out["by_regime"] = {k: [round(v.win.mean(), 3), len(v)] for k, v in traded.groupby("regime")}
         if t.overlap.notna().any():
             out["overlap_comparison"] = {"overlap_agreed": summ(traded[traded.overlap == True]),

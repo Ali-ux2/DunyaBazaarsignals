@@ -6,9 +6,9 @@ import json, logging, os, signal, sys, threading, time
 from datetime import datetime, timedelta, timezone
 import pandas as pd, requests
 import config as C
-from analyzer import analyze, compute, tracker, breakeven, precheck
+from analyzer import analyze, compute, tracker, breakeven, precheck, precheck_flip_kind
 from resolver import resolve, describe, Resolution
-from chart import result_caption, render_result_chart, render_chart, signal_caption
+from chart import result_caption, render_result_chart, render_chart, signal_caption, display_name
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -116,6 +116,15 @@ class OTChartsAdapter:
 
     def usage(self): return self._get("/v1/usage").get("requests", {})
 
+    def fetch_candles(self, pair, limit):
+        """One /v1/candles call (stream warm-up). Returns closed candles in true UTC."""
+        r = self.res.get(pair); sym, book = (r.symbol, r.book) if r and r.symbol else (C.symbol_for(pair), C.BROKER_BOOK)
+        j = self._get("/v1/candles", venue=book, symbol=sym, tf=60, limit=limit)
+        df = pd.DataFrame(j.get("candles", []))
+        if df.empty: return None
+        df["time"] = pd.to_datetime(df.time, unit="s", utc=True) - timedelta(hours=C.BOOK_UTC_OFFSET_H.get(book, 0))
+        return closed_only(df.set_index("time")[["open", "high", "low", "close"]].astype(float), self.now())
+
 class ReplayAdapter:
     """CSV with columns time,pair,open,high,low,close. Simulated clock; no sleeping."""
     def __init__(self, path):
@@ -194,7 +203,9 @@ class Bot:
         self.manual_pause = False; self.budget_pause = False; self.warned_budget = False
         self.pending = None            # active trade
         self.prechecks = 0
-        self.day = {p: [0, 0, 0] for p in C.PAIRS}; self.day_date = data.now().date()
+        self.day = {p: [0, 0, 0] for p in self.all_pairs if hasattr(self, "all_pairs")} if hasattr(self, "all_pairs") else {p: [0, 0, 0] for p in C.PAIRS}; self.day_date = data.now().date()
+        self.kind_day = {"confirmed": [0, 0], "switched": [0, 0]}
+        self.all_pairs = list(C.PAIRS); self.poll_adapter = None; self.stream_since = None
         self.compound_active = list(C.COMPOUND_PAIRS); self.lost_ladders = {}; self.rotated_out = set(); self.ladder = {}
         self.block_until = None        # cooldown end (datetime)
         self.sessions = parse_sessions(C.SESSIONS_UTC); self.usage_at = 0.0
@@ -216,6 +227,35 @@ class Bot:
         if cmd == "/pause": self.manual_pause = True; self.tg.admin("⏸ Paused by admin")
         elif cmd == "/resume": self.manual_pause = False; self.budget_pause = False; self.tg.admin("▶️ Resumed")
         elif cmd == "/status": self.tg.admin(self.status())
+        elif cmd in ("/test", "/testcard"): self.test_card()
+        elif cmd == "/help":
+            self.tg.admin("Admin commands:\n/pause: stop sending signals\n/resume: resume (also clears budget pause)\n"
+                          "/status: pause state, per-pair W/L, compounding eligibility\n/test (/testcard): post one sample card to the group\n/help: this list")
+
+    def test_card(self):
+        """Post a sample card with the real card builder + chart. Touches no stats, cooldowns, trades.csv, precheck or results."""
+        pair, d = "USDINR", "CALL"
+        lab = self.d.label(pair) if hasattr(self.d, "label") else "USDINR_otc"
+        entry = self.d.now().replace(second=0, microsecond=0) + timedelta(minutes=1)
+        df, src = None, "synthetic"
+        try:
+            df, _, _ = self.d.candles(pair)
+            if df is not None and len(df) >= 30: src = "live"
+            else: df = None
+        except Exception as e: log.warning("test card: candles unavailable (%s)", e)
+        if df is None:
+            from analyzer import synthetic
+            df = synthetic(n=60, seed=11, start=83.2)
+        p1, p2 = self.playbook(d)
+        hdr = "🧪 TEST CARD — NOT A LIVE SIGNAL"
+        cap = hdr + "\n" + signal_caption(lab, d, entry, C.EXPIRY_MIN, (p1, p2) if C.PRECHECK_MODE in ("confirm", "direction") else None,
+                                          C.PRECHECK_SECOND, self.wait_line()) + "\n" + hdr
+        sent = False
+        if C.SIGNAL_CHART:
+            try: sent = self.tg.group_photo(render_chart(df, lab), cap, "test_card.png")
+            except Exception as e: log.warning("test card chart failed (%s); sending text", e)
+        if not sent: self.tg.group(cap)
+        self.tg.admin(f"🧪 Test card posted (chart from {src} candles)")
     def status(self):
         lines = [f"Paused: manual={self.manual_pause} budget={self.budget_pause} session={self.in_session()}"]
         for p in C.PAIRS:
@@ -236,6 +276,19 @@ class Bot:
         try: u = self.d.usage()
         except Exception as e: log.warning("usage check failed: %s", e); return
         used, quota = u.get("used", 0), u.get("quota") or 1; frac = used/quota
+        from stream import StreamAdapter
+        if isinstance(self.d, StreamAdapter):
+            if C.MODE == "auto" and self.stream_since and self.d.now().date() > self.stream_since and frac < C.STREAM_SWITCH_AT \
+                    and not self.pending:
+                self.switch_to_poll(used, quota); return
+            if frac >= C.BUDGET_PAUSE and self.d.rest_allowed:
+                self.d.rest_allowed = False
+                self.tg.admin(f"🛑 API budget {frac:.0%} ({used}/{quota}): REST calls stopped (payouts from cache); stream keeps running.")
+            return
+        reserve = len(C.STREAM_PAIRS[:C.STREAM_MAX_INSTRUMENTS]) + 2 + len(C.PAIRS)   # warm-up + stream open + one poll cycle
+        if C.MODE == "auto" and isinstance(self.d, OTChartsAdapter) and (frac >= C.STREAM_SWITCH_AT or quota - used <= reserve) \
+                and not self.pending:
+            self.switch_to_stream(used, quota, frac); return
         if frac >= C.BUDGET_PAUSE and not self.budget_pause:
             self.budget_pause = True; self.tg.admin(f"🛑 API budget {frac:.0%} ({used}/{quota}). Auto-paused. /resume after reset.")
         elif frac >= C.BUDGET_WARN and not self.warned_budget:
@@ -243,10 +296,39 @@ class Bot:
         elif frac < C.BUDGET_WARN: self.warned_budget = False
         log.info("API usage %d/%d (%.0f%%)", used, quota, frac*100)
 
+    # ---- auto mode switching ----
+    def switch_to_stream(self, used, quota, frac):
+        from stream import StreamAdapter
+        try:
+            C.MIN_BARS = C.STREAM_MIN_BARS
+            rest = self.d; sa = StreamAdapter(rest=rest, stop=threading.Event())
+            sa.rest_allowed = frac < C.BUDGET_PAUSE
+            self.poll_adapter, self.d, self.stream_since = rest, sa, sa.now().date()
+            C.PAIRS = list(sa.pairs)
+            self.tg.admin(f"🔀 Switched to STREAM mode at {frac:.0%} budget ({used}/{quota}): 1 stream × {len(sa.pairs)} pairs "
+                          f"{sa.pairs}. Polling stopped for the other {len(self.all_pairs) - len(sa.pairs)} pairs until the midnight UTC reset.")
+        except Exception as e:
+            C.MIN_BARS = C.POLL_MIN_BARS; log.exception("stream switch failed"); self.tg.admin(f"⚠️ Stream switch failed: {e}. Staying in poll mode.")
+
+    def switch_to_poll(self, used, quota):
+        sa, rest = self.d, self.poll_adapter
+        for p, book in sa.books.items():           # hand stream-built candles back to the poller (no extra requests)
+            df = book.df()
+            if df is not None: rest.cache[p] = df
+        for p in self.all_pairs:
+            if p not in sa.books: rest.cache.pop(p, None)   # stale: refetch full history once
+        C.MIN_BARS = C.POLL_MIN_BARS
+        sa.close(); self.d = rest; C.PAIRS = list(self.all_pairs); self.stream_since = None
+        rest.meta_at = 0
+        self.tg.admin(f"🔁 Daily quota reset ({used}/{quota}): stream closed, back to POLL mode for all {len(C.PAIRS)} pairs.")
+
     # ---- one minute ----
     def tick(self):
         now = self.d.now()
         self.maybe_daily_summary()
+        if hasattr(self.d, "admin_messages"):
+            for m in self.d.admin_messages(): self.tg.admin(m)
+        if hasattr(self.d, "persist"): self.d.persist()
         self.check_budget()
         if self.manual_pause or self.budget_pause or not self.in_session():
             log.info("idle (paused/out of session)"); return
@@ -283,15 +365,22 @@ class Bot:
 
     # ---------- messages ----------
     def playbook(self, d):
-        if d == "CALL":
-            return ("If the current candle is GREEN at :57 → enter CALL", "If it's RED strongly → SKIP")
-        return ("If the current candle is RED at :57 → enter PUT", "If it's GREEN strongly → SKIP")
+        s = C.PRECHECK_SECOND
+        if C.PRECHECK_MODE == "direction":
+            if d == "CALL": return (f"If current candle is GREEN at :{s} → CALL", f"🔄 If RED strongly → PUT")
+            return (f"If current candle is RED at :{s} → PUT", f"🔄 If GREEN strongly → CALL")
+        if d == "CALL": return (f"If the current candle is GREEN at :{s} → enter CALL", "⛔ If it's RED strongly → SKIP")
+        return (f"If the current candle is RED at :{s} → enter PUT", "⛔ If it's GREEN strongly → SKIP")
+
+    def wait_line(self):
+        if C.PRECHECK_MODE == "direction": return f"Wait for ✅ CONFIRMED / 🔄 SWITCH at :{C.PRECHECK_SECOND}"
+        return f"Wait for ✅ CONFIRMED / ❌ SKIP at :{C.PRECHECK_SECOND}"
 
     def post_signal(self, s):
         lab = self.d.label(s["pair"]); entry = s["entry_at"]; d = s["signal"]
         arrow = "🟢 CALL ⬆️" if d == "CALL" else "🔴 PUT ⬇️"
         p1, p2 = self.playbook(d)
-        cap = signal_caption(lab, d, entry, C.EXPIRY_MIN, (p1, p2) if C.PRECHECK_MODE == "confirm" else None, C.PRECHECK_SECOND)
+        cap = signal_caption(lab, d, entry, C.EXPIRY_MIN, (p1, p2) if C.PRECHECK_MODE in ("confirm", "direction") else None, C.PRECHECK_SECOND, self.wait_line())
         sent = False
         if C.SIGNAL_CHART and s.get("_df") is not None:
             try: sent = self.tg.group_photo(render_chart(s["_df"], lab), cap, f"signal_{s['pair']}_{entry:%Y%m%d_%H%M}.png")
@@ -306,7 +395,9 @@ class Bot:
             f"🟢 Sent {s['pair']} → {lab} {d}{self.d.note(s['pair'], d)} · entry {entry:%H:%M}\n"
             f"Regime {s['regime']} (ADX {s.get('adx','?')}) · score {s['score']}/{s['max_score']} ({s['confidence']}%) · payout {s['payout']:.0%} (BE {s['breakeven']:.1%})\n"
             f"S {s['support']:.5f} / R {s['resistance']:.5f} · ATR {a:.5f} · overlap={s.get('overlap')}\nVotes:\n{votes}\n"
-            f"Playbook reasoning:\n  • '{p1}': confirms if the candle is with the signal, or the opposing body is < {C.PC_SMALL_BODY_ATR} ATR, and price hasn't run > {C.PC_EXHAUST_ATR} ATR (exhausted) or reached S/R\n"
+            + ("\nDirection mode: no skips. Strong opposing candle → SWITCH (momentum); signal side already ran > "
+               f"{C.PC_EXHAUST_ATR} ATR or hit S/R → SWITCH (reversion); otherwise CONFIRMED." if C.PRECHECK_MODE == "direction" else "") +
+            f"\nPlaybook reasoning:\n  • '{p1}': confirms if the candle is with the signal, or the opposing body is < {C.PC_SMALL_BODY_ATR} ATR, and price hasn't run > {C.PC_EXHAUST_ATR} ATR (exhausted) or reached S/R\n"
             f"  • '{p2}': cancels if the opposing body is ≥ {C.PC_STRONG_BODY_ATR} ATR, it moved > {C.PC_MAX_ADVERSE_ATR} ATR against, or crossed back through EMA9 / the signal-candle midpoint{comp}")
 
     def run_precheck(self):
@@ -317,7 +408,7 @@ class Bot:
         fstart = t["entry_at"] - timedelta(minutes=1)
         bar = df.loc[df.index == fstart] if df is not None else None
         if bar is None or bar.empty:
-            ok, why = (C.PRECHECK_MODE != "confirm"), "forming candle unavailable"
+            ok, why = (C.PRECHECK_MODE != "confirm"), "forming candle unavailable"   # direction mode: keep original
         else:
             ok, why = precheck(t, float(bar.open.iloc[0]), float(bar.close.iloc[0]))
         t["precheck_ok"], t["precheck_reason"] = ok, why
@@ -329,14 +420,25 @@ class Bot:
             cinfo = f"forming candle {colour}, body {body:.2f} ATR"
         else: cinfo = "forming candle unavailable"
         t["precheck_candle"] = cinfo
-        if C.PRECHECK_MODE == "confirm":
+        if C.PRECHECK_MODE == "direction":
+            name = display_name(lab); kind = precheck_flip_kind(ok, why); t["original_signal"] = t["signal"]
+            if kind is None:
+                t["kind"] = "confirmed"
+                self.tg.group(f"✅ CONFIRMED {name} {t['signal']} — enter now")
+                self.tg.admin(f"✅ Precheck {t['pair']} ({lab}): {cinfo} → CONFIRMED {t['signal']}. {why}")
+            else:
+                t["kind"] = f"switched-{kind}"; t["signal"] = "PUT" if t["signal"] == "CALL" else "CALL"
+                self.tg.group(f"🔄 SWITCH {name} {t['signal']} — enter now")
+                self.tg.admin(f"🔄 Precheck {t['pair']} ({lab}): {cinfo} → SWITCH {t['original_signal']}→{t['signal']} "
+                              f"({'momentum: follow the opposing candle' if kind == 'momentum' else 'reversion: move exhausted / at S/R'}). {why}")
+        elif C.PRECHECK_MODE == "confirm":
             if ok:
                 self.tg.group(f"✅ CONFIRMED {lab} {t['signal']} — enter now at {t['entry_at']:%H:%M}:00")
                 self.tg.admin(f"✅ Precheck OK {t['pair']} ({lab}): {cinfo} → TRADE. {why}")
             else:
                 self.tg.group(f"❌ SKIP {lab} {t['signal']}")
                 self.tg.admin(f"❌ Precheck CANCEL {t['pair']} ({lab}): {cinfo} → SKIPPED (not a loss). {why}")
-                self.day[t["pair"]][2] += 1
+                self.day.setdefault(t["pair"], [0, 0, 0])[2] += 1
                 self.log_trade(t, float("nan"), float("nan"), "CANCELLED"); self.pending = None
                 self.block_until = self.d.now() + timedelta(minutes=C.RESULT_COOLDOWN_MIN)
         else:
@@ -365,8 +467,12 @@ class Bot:
                         sent = self.tg.group_photo(png, cap, f"{t['pair']}_{t['entry_at']:%Y%m%d_%H%M}.png")
                     except Exception as e: log.warning("chart render failed (%s); sending text", e)
                 if not sent: self.tg.group(cap)
-            if not tie: self.day[t["pair"]][0 if win else 1] += 1
-            self.tg.admin(f"📋 Round {t['entry_at']:%H:%M} {t['pair']} ({self.d.label(t['pair'])}) {t['signal']} · "
+            if not tie:
+                self.day.setdefault(t["pair"], [0, 0, 0])[0 if win else 1] += 1
+                k = "switched" if t.get("kind", "").startswith("switched") else "confirmed"
+                self.kind_day[k][0 if win else 1] += 1
+            self.tg.admin(f"📋 Round {t['entry_at']:%H:%M} {t['pair']} ({self.d.label(t['pair'])}) {t.get('original_signal', t['signal'])}"
+                          f"{(' → traded ' + t['signal'] + ' (' + t.get('kind', '') + ')') if t.get('original_signal', t['signal']) != t['signal'] else ' (confirmed)'} · "
                           f"precheck: {t.get('precheck_candle', 'n/a')} → traded · result {res} ({o:.5f} → {c:.5f})")
             if not tie: self.ladder_update(t["pair"], win)
             g = tracker.gate(t["pair"], t["payout"])
@@ -417,16 +523,19 @@ class Bot:
             lines = [f"📊 Daily summary {self.day_date} (UTC)"]
             tw = tl = tc = 0
             for p in C.PAIRS:
-                w, l, c = self.day[p]; tw += w; tl += l; tc += c
+                w, l, c = self.day.get(p, (0, 0, 0)); tw += w; tl += l; tc += c
                 if w or l or c: lines.append(f"  {p}: {w}W / {l}L / {c} skipped" + (f" · {w/(w+l):.0%}" if w+l else ""))
             lines.append(f"  Total {tw}W / {tl}L / {tc} skipped · prechecks {self.prechecks}")
+            for k, (w, l) in self.kind_day.items():
+                lines.append(f"  {k}: {w}W / {l}L" + (f" · WR {w/(w+l):.0%}" if w + l else ""))
             try: u = self.d.usage(); lines.append(f"  API budget used {u.get('used')}/{u.get('quota')}")
             except Exception: pass
             if self.rotated_out: lines.append(f"  Rotated out today: {sorted(self.rotated_out)}")
             lines.append(f"  Compounding active: {self.compound_active}")
             lines.append("  Eligibility: " + self.eligibility_line())
             self.tg.admin("\n".join(lines))
-        self.day = {p: [0, 0, 0] for p in C.PAIRS}; self.day_date = today
+        self.day = {p: [0, 0, 0] for p in self.all_pairs if hasattr(self, "all_pairs")} if hasattr(self, "all_pairs") else {p: [0, 0, 0] for p in C.PAIRS}; self.day_date = today
+        self.kind_day = {"confirmed": [0, 0], "switched": [0, 0]}
         self.compound_active = list(C.COMPOUND_PAIRS); self.lost_ladders = {}; self.rotated_out = set(); self.ladder = {}
 
     def log_trade(self, t, o, c, res):
@@ -434,15 +543,27 @@ class Bot:
         new = not os.path.exists(C.TRADE_LOG)
         with open(C.TRADE_LOG, "a", newline="") as f:
             w = csv.writer(f)
-            if new: w.writerow(["entry_at", "pair", "dir", "confidence", "regime", "payout", "overlap", "precheck", "open", "close", "result"])
+            if new: w.writerow(["entry_at", "pair", "dir", "confidence", "regime", "payout", "overlap", "precheck", "original_dir", "traded_as", "open", "close", "result"])
             w.writerow([f"{t['entry_at']:%Y-%m-%d %H:%M}", t["pair"], t["signal"], t["confidence"], t["regime"], t["payout"],
-                        t.get("overlap"), t.get("precheck_reason", ""), o, c, res])
+                        t.get("overlap"), t.get("precheck_reason", ""), t.get("original_signal", t["signal"]), t.get("kind", ""), o, c, res])
 
 def main():
     miss = C.missing_secrets()
     if miss:
         log.error("Missing required env vars: %s. Set them in Railway > Variables. Exiting.", ", ".join(miss)); sys.exit(2)
-    data = ReplayAdapter(C.REPLAY_CSV) if C.DATA_SOURCE == "replay" else OTChartsAdapter()
+    from stream import StreamAdapter, MockTickSource
+    mock = None
+    if C.DATA_SOURCE == "replay": data = ReplayAdapter(C.REPLAY_CSV)
+    elif C.DATA_SOURCE == "mockstream":
+        mock = MockTickSource([C.symbol_for(p) for p in C.STREAM_PAIRS[:C.STREAM_MAX_INSTRUMENTS]],
+                              (pd.Timestamp(os.environ["MOCK_START"]).to_pydatetime() if os.environ.get("MOCK_START") else datetime(2026, 1, 5, 6, 0, tzinfo=UTC)), seed=int(os.environ.get("MOCK_SEED", "7")))
+        data = StreamAdapter(rest=None, mock=mock)
+    elif C.MODE == "stream":
+        rest = None
+        try: rest = OTChartsAdapter()
+        except Exception as e: log.warning("REST unavailable at startup (%s); stream-only", e)
+        data = StreamAdapter(rest=rest, stop=STOP)
+    else: data = OTChartsAdapter()
     bot = Bot(data)
     signal.signal(signal.SIGTERM, lambda *_: STOP.set()); signal.signal(signal.SIGINT, lambda *_: STOP.set())
     log.info("Started: source=%s book=%s pairs=%d telegram=%s", C.DATA_SOURCE, C.BROKER_BOOK, len(C.PAIRS), C.TELEGRAM_ENABLED)
@@ -452,6 +573,17 @@ def main():
     if hasattr(data, "res"):
         bot.tg.admin("🔎 Symbol resolution:\n" + "\n".join(describe(r) for r in data.res.values()))
     n = 0
+    if mock is not None:   # simulated clock driven by mocked ticks
+        t = mock.now().replace(second=0) + timedelta(minutes=1)
+        for n in range(C.DRY_RUN_MINUTES or 600):
+            mock.advance_to(t.replace(second=C.SCAN_SECOND))
+            try:
+                bot.tick()
+                if bot.pending and not bot.pending["prechecked"]:
+                    mock.advance_to(bot.pending["precheck_at"]); bot.run_precheck()
+            except Exception: log.exception("tick failed")
+            t += timedelta(minutes=1)
+        STOP.set()
     while not STOP.is_set():
         if isinstance(data, ReplayAdapter):
             try:
@@ -474,6 +606,7 @@ def main():
         if STOP.wait((target - now).total_seconds()): break
         try: bot.tick()
         except Exception: log.exception("tick failed (continuing)")
+    if hasattr(bot.d, "close"): bot.d.close()
     bot.maybe_daily_summary(force=True); bot.save_stats(); log.info("Stopped cleanly. %s", bot.status().replace("\n", " | "))
 
 if __name__ == "__main__":

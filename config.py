@@ -15,7 +15,8 @@ TELEGRAM_CHANNEL_ID = _env("TELEGRAM_CHANNEL_ID", "CHANNEL_ID", "CHAT_ID", "TELE
 TELEGRAM_ADMIN_ID   = _env("TELEGRAM_ADMIN_ID", "ADMIN_CHAT_ID", "ADMIN_ID")
 
 # ---- runtime mode ----
-DATA_SOURCE     = _env("DATA_SOURCE", default="otcharts")   # otcharts | replay
+DATA_SOURCE     = _env("DATA_SOURCE", default="otcharts")   # otcharts | replay | mockstream (tests)
+MODE            = _env("MODE", default="auto").lower()       # auto (default: poll all PAIRS, stream STREAM_PAIRS near budget limit) | poll | stream
 REPLAY_CSV      = _env("REPLAY_CSV", default="replay_m1.csv")
 TELEGRAM_ENABLED = _env("TELEGRAM_ENABLED", default="1") == "1"
 DRY_RUN_MINUTES = int(_env("DRY_RUN_MINUTES", default="0"))  # replay: stop after N simulated minutes
@@ -35,8 +36,10 @@ BUDGET_WARN     = 0.80
 BUDGET_PAUSE    = 0.95
 USAGE_CHECK_SEC = 300
 
-PAIRS = ["USDINR", "USDMXN", "USDARS", "USDPKR", "USDBDT", "USDCOP", "USDPHP",
-         "USDIDR", "USDEGP", "USDNGN", "USDDZD", "USDBRL"]
+_DEFAULT_PAIRS = ["USDBRL", "USDMXN", "USDINR", "USDPKR", "USDDZD", "USDARS", "USDBDT", "USDCOP", "USDIDR", "USDPHP", "USDEGP", "USDNGN"]
+# All 12 enabled; the live payout gate (MIN_PAYOUT 77%) filters low-payout pairs per signal.
+DISABLED_PAIRS: list = []   # move pairs here (and out of _DEFAULT_PAIRS) to disable
+PAIRS = [p.strip().upper() for p in _env("PAIRS", default=",".join(_DEFAULT_PAIRS)).split(",") if p.strip()]
 
 # Pairs used for compounding sessions (never removed from PAIRS even if a book lacks them)
 COMPOUND_PAIRS = ["USDINR", "USDMXN", "USDBRL"]
@@ -69,7 +72,7 @@ SCAN_MODE       = _env("SCAN_MODE", default="closed")   # closed: evaluate close
 SCAN_SECOND     = 52 if SCAN_MODE == "early52" else 2
 
 # ---- pre-entry confirmation (re-check forming candle just before entry) ----
-PRECHECK_MODE   = _env("PRECHECK_MODE", default="confirm")  # confirm | log | off
+PRECHECK_MODE   = _env("PRECHECK_MODE", default="direction")  # direction (never skip: confirm or switch) | confirm | log | off
 PRECHECK_SECOND = int(_env("PRECHECK_SECOND", default="57"))
 PC_SMALL_BODY_ATR   = 0.30   # body < 0.30*ATR counts as "small" (neutral, OK)
 PC_STRONG_BODY_ATR  = 0.60   # opposing body >= 0.60*ATR = strongly against -> cancel
@@ -103,7 +106,11 @@ BODY_MIN, WICK_MAX = 0.60, 0.30
 W_TREND = dict(trend=2.0, momentum=1.5, location=1.0, candle=1.0)
 W_RANGE = dict(trend=0.0, momentum=1.0, location=2.0, candle=1.0)
 MIN_CONF = 0.70
-MIN_BARS = 260
+STREAM_WARMUP_BARS = max(30, min(50, int(_env("STREAM_WARMUP_BARS", default="50"))))  # /v1/candles per pair on every stream open
+MIN_BARS = int(_env("MIN_BARS", default="50" if MODE == "stream" or DATA_SOURCE == "mockstream" else "260"))
+POLL_MIN_BARS = MIN_BARS
+STREAM_MIN_BARS = int(_env("MIN_BARS", default=str(STREAM_WARMUP_BARS)))  # auto mode: stream phase signals right after instant warm-up
+ATR_PCTL_MIN_PERIODS = 30   # ATR percentile uses whatever window exists (>=30 bars); noisier until ~240 bars
 OVERLAP_MODE = _env("OVERLAP_MODE", default="log")  # off | log | require (filter only, never creates signals)
 OVERLAP_LOOKBACK = 5
 MAX_GAP_RUNS = 0         # reject if the recent window has feed gaps
@@ -114,6 +121,20 @@ DEFAULT_PAYOUT = 0.85    # used in replay / when book gives no payout
 PAYOUT_EDGE_MARGIN = 0.01
 ROLLING_N = 50
 MIN_TRADES_FOR_GATE = 30
+
+# ---- stream mode ----
+STREAM_PAIRS = [p.strip().upper() for p in _env("STREAM_PAIRS", default="USDINR,USDIDR,USDCOP,USDMXN,USDBRL").split(",") if p.strip()]
+STREAM_MAX_INSTRUMENTS = int(_env("STREAM_MAX_INSTRUMENTS", default="5"))   # Lite plan: 1 stream x 5 instruments
+STREAM_429_BACKOFF_SEC = 300
+STREAM_SWITCH_AT = float(_env("STREAM_SWITCH_AT", default="0.93"))  # auto: open the stream while its 1 request is still available
+STREAM_REOPEN_DROPPED_MIN = 3
+STREAM_STALE_SEC = 90               # no tick for this long counts as a feed gap
+STREAM_FALLBACK_PAYOUT = float(_env("STREAM_FALLBACK_PAYOUT", default="0.85"))  # used only if no live/cached payout
+PERSIST_CANDLES = 300
+CANDLE_DIR = os.path.join(STATE_DIR, "candles")
+PAYOUT_CACHE = os.path.join(STATE_DIR, "payouts.json")
+RESOLUTION_CACHE = os.path.join(STATE_DIR, "resolutions.json")
+if MODE == "stream": PAIRS = list(STREAM_PAIRS)
 
 def missing_secrets():
     need = {"OTCHARTS_API_KEY": OTCHARTS_API_KEY if DATA_SOURCE == "otcharts" else "n/a"}

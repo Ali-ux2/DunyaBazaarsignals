@@ -21,12 +21,13 @@ def result_caption(res: str, symbol: str, direction: str, entry: float | None = 
     lines += ["—", BRAND_FOOTER]
     return "\n".join(lines)
 
-def signal_caption(symbol: str, direction: str, entry_at, expiry_min: int, playbook: tuple | None, precheck_second: int) -> str:
+def signal_caption(symbol: str, direction: str, entry_at, expiry_min: int, playbook: tuple | None, precheck_second: int,
+                   wait_line: str | None = None) -> str:
     arrow = "🟢 CALL ⬆️" if direction == "CALL" else "🔴 PUT ⬇️"
     lines = ["🚀 Signal ready", "------ { DUNYABAZAAR } ------", f"<b>{display_name(symbol)}</b>  {arrow}",
              f"⏰ Entry {entry_at:%H:%M}:00 UTC · ⌛ {expiry_min} min"]
     if playbook:
-        lines += [f"▶️ {playbook[0]}", f"⛔ {playbook[1]}", f"Wait for ✅ CONFIRMED / ❌ SKIP at :{precheck_second}"]
+        lines += [f"▶️ {playbook[0]}", playbook[1], wait_line or f"Wait for ✅ CONFIRMED at :{precheck_second}"]
     lines += ["------------------------------", CONTACT]
     return "\n".join(lines)
 
