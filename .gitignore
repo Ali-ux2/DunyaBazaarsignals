@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+*.log
+trades.csv
+pair_stats.json
+state/
+charts/
+*.png
+replay_m1.csv
