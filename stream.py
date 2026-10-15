@@ -11,7 +11,7 @@ NOT documented: whether an already-open stream survives once the daily quota is 
 should be refused (it costs a request). So this client never closes a healthy stream on purpose."""
 from __future__ import annotations
 import json, logging, math, os, threading, time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd, requests
 import config as C
@@ -40,8 +40,9 @@ def parse_sse(lines):
 
 # ---------------- candles from ticks ----------------
 class CandleBook:
-    def __init__(self): self.bars = {}; self.last_tick = None
+    def __init__(self): self.bars = {}; self.last_tick = None; self.ticks = deque(maxlen=4000)   # raw ticks for 5 s bars (B1)
     def on_tick(self, t: float, price: float):
+        self.ticks.append((t, price))
         m = int(t // 60) * 60; b = self.bars.get(m)
         if b is None: self.bars[m] = [price, price, price, price]
         else: b[1] = max(b[1], price); b[2] = min(b[2], price); b[3] = price
@@ -386,6 +387,13 @@ class StreamAdapter:
             if p not in self.books: return
             if p and data.get("price") is not None:
                 t = float(data["time"]) - 3600 * C.BOOK_UTC_OFFSET_H.get(C.BROKER_BOOK, 0)
+                tel = getattr(self, "telemetry", None)
+                if tel is not None:
+                    try:
+                        rt = time.time(); lt = self.books[p].last_tick
+                        if lt is not None and int(t // 60) > int(lt // 60): tel.on_bar_seen(p, (int(lt // 60)) * 60, t if self.mock else rt)  # closed bar complete
+                        tel.on_tick(p, t, float(data["price"]), t if self.mock else rt)
+                    except Exception: pass
                 self.books[p].on_tick(t, float(data["price"]))
         elif ev == "connected": log.info("stream connected: %s", data.get("symbols"))
         elif ev == "dropped":

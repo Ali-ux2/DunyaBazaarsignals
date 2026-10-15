@@ -188,7 +188,7 @@ LEVEL_FILE = os.path.join(STATE_DIR, "level.json")
 LEVEL_AUTO_EVERY = 20          # settled real trades between auto evaluations
 LEVEL_AUTO_LOOSEN_MARGIN = 0.05
 LEVEL_AUTO_LOW_RATE = 1.0      # signals/hour over the last 2 h of active time counts as "low"
-LEVEL_AUTO_MIN, LEVEL_AUTO_MAX = 1, 5   # level 5 only while the last 20 trades are at/above breakeven
+LEVEL_AUTO_MIN, LEVEL_AUTO_MAX = 1, 4   # auto never goes to 5 (live shadow at L5: 8W/14L 36% on 2026-10-15); /level 5 manual only
 for _k, _v in LEVELS[3].items(): globals()[_k] = _v                 # strict defaults = level 3
 ENTRY_CHECK = _env("ENTRY_CHECK", default="1").lower() in ("1", "true", "yes", "on")   # closed candle overextended from EMA9 -> no group signal
 STRATEGY_STATS_FILE = os.path.join(STATE_DIR, "strategy_stats.json")
@@ -196,8 +196,8 @@ STRATEGY_STATS_FILE = os.path.join(STATE_DIR, "strategy_stats.json")
 # ---- bug / glitch watcher (EXPERIMENTAL, admin only) ----
 BUG_WATCH = _env("BUG_WATCH", default="1").lower() in ("1", "true", "yes", "on")
 BUG_FILE = os.path.join(STATE_DIR, "bug_watch.json")
-BUG_MIN_SAMPLES = 20
-BUG_MIN_RATE = 0.65
+BUG_MIN_SAMPLES = 40
+BUG_MIN_RATE = 0.68
 BUG_MAX_P = 0.01               # one-sided binomial p-value vs 50% (keeps random data from triggering)
 BUG_SCAN_MIN = 5               # non-stream pairs: re-scan history every N minutes (only candles already fetched)
 BUG_STREAM_MIN_SAMPLES = 15     # live stream pairs: scanned every closed candle with a lower sample minimum
@@ -206,7 +206,19 @@ BUG_PROMOTE_MARGIN = 0.05       # promote to 'candidate' at >= breakeven + 5 pts
 BUG_ALERT_COOLDOWN_H = 6       # same pattern on the same pair alerts at most once per 6 h
 BUG_MAX_ALERTS_PER_HOUR = 3
 BUG_BIG_ATR = 1.2
-BUG_SAME_BODY_FRAC = 0.05      # identical consecutive bodies on >= 5% of bars (and >= BUG_MIN_SAMPLES) = glitch
+BUG_SAME_BODY_FRAC = 0.05
+# bug SIGNALS (live): admin (default) | group | candidates | off  (runtime: /bugsignals)
+BUG_CHANNEL_ID = _env("BUG_CHANNEL_ID")                         # optional dedicated 🐞 bug group
+BUG_SIGNALS = _env("BUG_SIGNALS", default="admin").lower()   # admin | group | candidates | off — extra routing only; the bug group (if set) always gets bug signals
+BUG_SIGNALS_FILE = os.path.join(STATE_DIR, "bug_signals.json")
+BUG_SIGNAL_COOLDOWN_MIN = 5    # per pattern/strategy
+BUG_PAIR_COOLDOWN_MIN = 3      # per pair
+BUG_DEMOTE_MIN_FW = 10         # below breakeven after >= 10 forward trades -> stops firing
+BUG_STRAT_VARIANT = _env("BUG_STRAT_VARIANT", default="improved").lower()   # improved | original
+BUG_STRATS = [s.strip().upper() for s in _env("BUG_STRATS", default="B1,B2,B3,B4,B5,B6,E,F").split(",") if s.strip()]
+B1_SPIKE_X, B1_WICK_FRAC, B1_WICK_X, B1_CHECK_SECOND = 3.0, 0.60, 2.5, 30
+B2_BODY_ATR, B2_BODY_FRAC, B2_DIST_ATR, B2_LOOKBACK, B2_TOUCHES = 0.8, 0.6, 0.3, 50, 2
+B3_ZZ_DEV_ATR, B3_ZZ_DEPTH, B3_PUSH = 1.5, 12, 3      # identical consecutive bodies on >= 5% of bars (and >= BUG_MIN_SAMPLES) = glitch
 
 # ---- payout / pair management (NO martingale) ----
 MIN_PAYOUT = 0.77        # never signal below 77%
@@ -242,3 +254,92 @@ def missing_secrets():
                     TELEGRAM_CHANNEL_ID=TELEGRAM_CHANNEL_ID or VIP_CHANNEL_ID or PUBLIC_CHANNEL_ID,
                     TELEGRAM_ADMIN_ID=TELEGRAM_ADMIN_ID)
     return [k for k, v in need.items() if not v]
+
+# ---- telemetry (admin only, no requests) ----
+TELEMETRY = _env("TELEMETRY", default="1") == "1"
+TELEMETRY_CSV = _env("TELEMETRY_CSV", default="1") == "1"
+TELEMETRY_MAX_MB = float(_env("TELEMETRY_MAX_MB", default="20"))
+TELEMETRY_TICK_SAMPLE = int(_env("TELEMETRY_TICK_SAMPLE", default="10"))   # 1 in N normal ticks to CSV; anomalies always
+
+# ---- strategies E/F (ensemble members + bug-style signals) and bug strategies B4-B6 ----
+E_ZZ_DEPTH, E_ZZ_BACKSTEP, E_ZZ_DEV_POINTS, E_ZZ_DEV_ATR = 12, 3, 5, 1.0   # dev = max(5 points, 1.0 ATR) on 1m OTC (see README)
+E_DEM_N, E_DEM_LO, E_DEM_HI = 14, 0.30, 0.70
+F_RSI_N, F_RSI_LO, F_RSI_HI, F_CCI_N, F_CCI_X, F_LOOK = 12, 20, 80, 17, 100, 3
+B4_FREEZE_S = float(_env("B4_FREEZE_S", default="2.5"))     # seconds without price change
+B4_MOM_BARS = 6                                               # 5 s bars of trend momentum (30 s)
+B5_SUB_SECONDS = (10, 15); B5_N, B5_BODY_FRAC = 5, 0.70
+B6_BB = ((14, 2.0), (20, 2.0))
+TICK_CHECK_SECONDS = (15, 30, 45)                             # stream tick strategies (B1/B4/B5s) are checked at these seconds
+ENSEMBLE_EF = _env("ENSEMBLE_EF", default="1") == "1"         # E/F vote in the group ensemble
+LB_MIN_N, LB_MUTE_N, LB_BOOST_PTS = 20, 30, 0.03              # leaderboard: min trades, mute after, boost margin
+LB_W_MIN, LB_W_MAX = 0.5, 1.5
+GROUP_FILTER = _env("GROUP_FILTER", default="best").lower()          # best | all
+BEST_BOOTSTRAP = _env("BEST_BOOTSTRAP", default="ensemble").lower()  # ensemble | silent (until a strategy qualifies)
+PUBLIC_SESSION_START = _env("PUBLIC_SESSION_START", default="10:30")          # local (UTC+3) time the PUBLIC session opens
+PUBLIC_NET_TARGET = int(_env("PUBLIC_NET_TARGET", default="2"))               # close when public wins - losses reaches this (0 = no cap)
+PUBLIC_MAX_SIGNALS = int(_env("PUBLIC_MAX_SIGNALS", default="10"))            # safety stop
+PUBLIC_MAX_NET_LOSS = int(_env("PUBLIC_MAX_NET_LOSS", default="-3"))          # safety stop
+PUBLIC_TARGET_MSG = _env("PUBLIC_TARGET_MSG", default="1") == "1"
+PUBLIC_TARGET_TEXT = _env("PUBLIC_TARGET_TEXT", default="✅ Daily target reached ({w}W/{l}L, net +{net}) — see you tomorrow. More signals in VIP: @DBSdesk")
+PUBLIC_STOP_TEXT = _env("PUBLIC_STOP_TEXT", default="⏹ Public session closed for today: {w}W/{l}L (net {net:+d}). Back tomorrow at {start} UTC+3. More signals in VIP: @DBSdesk")
+PUBLIC_CAP_FILE = os.path.join(STATE_DIR, "public_cap.json")
+# "wins" (default, matches the user's examples W,W / W,L,W / W,L,L,W,W): close when wins >= target AND net >= +1.
+# "net": close when wins - losses >= target (strict reading; W,L,W would NOT close).
+PUBLIC_CLOSE_RULE = _env("PUBLIC_CLOSE_RULE", default="wins").lower()
+SCHED_MIN_GAP_S = float(_env("SCHED_MIN_GAP_S", default="0.05"))    # global gap between scheduled API calls
+SCHED_PER_CHAT_GAP_S = float(_env("SCHED_PER_CHAT_GAP_S", default="1.0"))
+PUBLIC_START_TEXT = _env("PUBLIC_START_TEXT", default="🟢 Public session is open — signals start now. Good luck! VIP: @DBSdesk")
+BUG_TIME_PATTERNS = _env("BUG_TIME_PATTERNS", default="0") == "1"   # hour-of-day / minute colour bias (false-positive source) off by default
+BUG_LIVE_MIN_FW = 10                                                  # statistical patterns signal only after >=10 forward trades at >= breakeven
+ENSEMBLE_ONLY = ""                                                    # shadow at live>=4: "BC" = single B or C strategy test
+STRAT_PRIOR = {"B": 1.2, "C": 1.2}                                    # initial ensemble weights; leaderboard overrides once >=20 trades
+DAY_STATE_FILE = os.path.join(STATE_DIR, "day_state.json")   # today's W/L, switches, ladders: survive restarts within the UTC day
+STATE_MARKER = os.path.join(STATE_DIR, ".state_marker")
+# ---- historical confirmation gate (all signals) ----
+HIST_GATE = _env("HIST_GATE", default="all").lower()               # all | bugs | off
+HIST_MARGIN = float(_env("HIST_MARGIN", default="0.03"))
+HIST_MIN_N = int(_env("HIST_MIN_N", default="15"))
+HIST_W7 = 2                                                          # 7d occurrences weigh double
+HIST_MIN_COVER_DAYS = float(_env("HIST_MIN_COVER_DAYS", default="7"))
+HIST_KEEP_DAYS = 30
+HIST_BACKFILL_MAX_REQ = int(_env("HIST_BACKFILL_MAX_REQ", default="800"))
+HIST_BACKFILL_LIMIT = int(_env("HIST_BACKFILL_LIMIT", default="10000"))   # bars per backfill call (OTCharts max may be lower)
+HIST_SAVE_SEC = 900
+HIST_CHECK_BUDGET_S = float(_env("HIST_CHECK_BUDGET_S", default="2"))   # max seconds a gate check may scan before it says "warming up"
+HIST_WARM_BUDGET_S = float(_env("HIST_WARM_BUDGET_S", default="3"))     # background warm-up seconds per minute
+FILL_MIN_HOUR = _env("FILL_MIN_HOUR", default="1") == "1"            # Tier-2 fill to reach MIN_SIGNALS_PER_HOUR
+FILL_START_MIN = int(_env("FILL_START_MIN", default="0"))            # paced fill: may start from :00
+FILL_SLOT_MIN = int(_env("FILL_SLOT_MIN", default="15"))             # pacing: aim for one signal per 15-minute slot
+FILL_SLOT_WAIT = int(_env("FILL_SLOT_WAIT", default="3"))            # minutes into a slot that Tier 1 gets first before a fill
+FILL_PAIR_GAP_MIN = int(_env("FILL_PAIR_GAP_MIN", default="10"))     # at most 1 fill per pair per 10 min
+FILL_WICK_MIN = float(_env("FILL_WICK_MIN", default="0.40"))
+FILL_LEVEL = int(_env("FILL_LEVEL", default="4"))                    # fill candidates may use this level's confidence thresholds
+TIERS_FILE = os.path.join(STATE_DIR, "tiers.json")
+# ---- loss-streak cooldown / blackouts / news ----
+LOSS_STREAK_N = int(_env("LOSS_STREAK_N", default="3"))
+STREAK_COOLDOWN_MIN = int(_env("COOLDOWN_MIN", default="30"))
+BLACKOUT_ON = _env("BLACKOUT", default="on").lower() != "off"
+# zone-local windows (DST-aware): London open 08:00 −15/+30, NY open 09:30 ±15, rollover/Tokyo 00:00 UTC ±15
+# = 09:45-10:30 / 16:15-16:45 / 02:45-03:15 UTC+3 during European/US summer time; they move by 1 h in winter (zoneinfo handles it).
+BLACKOUT_WINDOWS = _env("BLACKOUT_WINDOWS", default="Europe/London@07:45-08:30,America/New_York@09:15-09:45,UTC@23:45-00:15")
+NEWS_FILTER = _env("NEWS_FILTER", default="on").lower() != "off"
+NEWS_BLACKOUT_MIN = int(_env("NEWS_BLACKOUT_MIN", default="15"))
+NEWS_URL = _env("NEWS_URL", default="https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+NEWS_REFRESH_H = 6
+DOUBLE_CONFIRM = _env("DOUBLE_CONFIRM", default="on").lower() != "off"
+# ---- candle-pattern family P (patterns.py) ----
+PATTERNS_ON = _env("PATTERNS", default="on").lower() != "off"
+P_LIVE_MIN = int(_env("P_LIVE_MIN", default="20"))          # admin-only until ≥20 forward trades at ≥ breakeven
+# ---- daily stop / weekly tune ----
+DAILY_STOP_NET = int(_env("DAILY_STOP_NET", default="5"))      # net losses (losses − wins) on public/VIP → stop until DAILY_STOP_RESUME
+DAILY_STOP_RESUME = _env("TRADING_DAY_START", "DAILY_STOP_RESUME", default="08:00")   # UTC+3: trading day for the daily stops resets (and a stopped day reopens) here
+WEEKLY_TUNE = _env("WEEKLY_TUNE", default="on").lower() != "off"   # Sunday 03:00 UTC+3: ablation + proposals (auto-apply safe bounds only)
+WEEKLY_TUNE_APPLY = _env("WEEKLY_TUNE_APPLY", default="on").lower() != "off"
+DAILY_PROFIT_ALERT = int(_env("DAILY_PROFIT_ALERT", default="15"))   # net wins (W − L) → one-time admin alert
+DAILY_PROFIT_CLOSE = int(_env("DAILY_PROFIT_CLOSE", default="20"))   # net wins → live signals closed until the trading-day start (08:00) next day
+# ---- volume mode (Tier 3) ----
+VOLUME_MODE = _env("VOLUME_MODE", default="on").lower() != "off"     # user request: 4–6 signals per open hour
+VOLUME_TARGET = int(_env("VOLUME_TARGET", default="4"))
+VOLUME_MAX_HOUR = int(_env("VOLUME_MAX_HOUR", default="6"))           # cap for fills (Tier 2 + 3) per hour
+VOLUME_SLOT_MIN = int(_env("VOLUME_SLOT_MIN", default="10"))          # pace ≈ 1 per 10 min
+VOLUME_GUARD_N = int(_env("VOLUME_GUARD_N", default="40"))            # alert if Tier 3 < breakeven after this many live trades

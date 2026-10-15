@@ -256,7 +256,10 @@ def strat_voting(x, i, pair, p):
     s = analyze(None, pair, payout=p, x=x, i=i, use_gate=False)
     return ((s["signal"], round(s["confidence"]/100, 2)) if s["signal"] else None), s
 
-STRATEGY_NAMES = {"A": "trend-pullback", "B": "range-reversion", "C": "S/R-rejection", "D": "voting-engine"}
+STRATEGY_NAMES = {"A": "trend-pullback", "B": "range-reversion", "C": "S/R-rejection", "D": "voting-engine",
+                  "E": "ZigZag+DeMarker", "F": "double-oscillator"}
+STRAT_WEIGHTS = {}     # leaderboard weights 0.5-1.5 set by the bot once enough forward data (default 1.0)
+STRAT_MUTED = set()    # muted members still compute (paper-tracked) but don't vote
 
 def ensemble(df, pair, payout=None, x=None, i=None, gaps=0, use_gate=True):
     """Group signal: >= ENSEMBLE_MIN_AGREE strategies on one direction and no opposing strategy with score >= ENSEMBLE_STRONG_OPP.
@@ -273,19 +276,23 @@ def ensemble(df, pair, payout=None, x=None, i=None, gaps=0, use_gate=True):
     if r.atr_pctl > C.ATR_PCTL_MAX: return {"signal": None, "reject": "volatility spike"}
     if use_gate and (g := tracker.gate(pair, p)): return {"signal": None, "reject": g}
     d_vote, d_full = strat_voting(x, i, pair, p)
+    from bugstrats import strat_E, strat_F
     votes = {"A": strat_trend_pullback(x, i), "B": strat_range_reversion(x, i), "C": strat_sr_rejection(x, i), "D": d_vote}
-    calls = {k: v for k, v in votes.items() if v and v[0] == "CALL"}; puts = {k: v for k, v in votes.items() if v and v[0] == "PUT"}
+    if C.ENSEMBLE_EF: votes.update(E=strat_E(x, i), F=strat_F(x, i))
+    live = {k: v for k, v in votes.items() if k not in STRAT_MUTED and (not C.ENSEMBLE_ONLY or k in C.ENSEMBLE_ONLY)}
+    wt = lambda k, v: v[1] * STRAT_WEIGHTS.get(k, C.STRAT_PRIOR.get(k, 1.0))
+    calls = {k: v for k, v in live.items() if v and v[0] == "CALL"}; puts = {k: v for k, v in live.items() if v and v[0] == "PUT"}
     if not calls and not puts: return {"signal": None, "reject": "no strategy fired", "strategies": votes}
     side, agree, opp = ("CALL", calls, puts) if len(calls) > len(puts) or (len(calls) == len(puts) and
-                       sum(v[1] for v in calls.values()) >= sum(v[1] for v in puts.values())) else ("PUT", puts, calls)
+                       sum(wt(k, v) for k, v in calls.items()) >= sum(wt(k, v) for k, v in puts.items())) else ("PUT", puts, calls)
     if len(agree) < C.ENSEMBLE_MIN_AGREE:
         return {"signal": None, "reject": f"only {len(agree)} strategy agrees (need {C.ENSEMBLE_MIN_AGREE})", "strategies": votes}
-    strong = [k for k, v in opp.items() if v[1] >= C.ENSEMBLE_STRONG_OPP]
+    strong = [k for k, v in opp.items() if wt(k, v) >= C.ENSEMBLE_STRONG_OPP]
     if strong: return {"signal": None, "reject": f"strong opposing strategy {','.join(strong)}", "strategies": votes}
     ext = abs(r.close - r.ema_f)/(r.atr or 1e-12)
     if C.ENTRY_CHECK and ext > C.ENTRY_MAX_EXT_ATR:
         return {"signal": None, "reject": f"entry overextended: close {ext:.1f} ATR from EMA9 (> {C.ENTRY_MAX_EXT_ATR})", "strategies": votes}
-    conf = sum(v[1] for v in agree.values())/len(agree)
+    conf = min(1.0, sum(wt(k, v) for k, v in agree.items())/len(agree))
     out = _ctx(x, i, pair, p)
     out.update(signal=side, strategies=votes, agree=sorted(agree), oppose=sorted(opp), confidence=round(conf*100),
                score=round(sum(v[1] for v in agree.values()), 2), max_score=len(votes),
@@ -304,7 +311,11 @@ def level_overrides(level):
 def apply_level(level):
     """Main thread only: set the strict thresholds to a level; shadow = one level looser (capped at 5), overlap ignored."""
     for k, v in level_overrides(level).items(): setattr(C, k, v)
-    sh = level_overrides(min(5, int(level) + 1)); sh["OVERLAP_MODE"] = "off"; C.SHADOW_OVERRIDES = sh
+    lv = int(level)
+    if lv >= 4:   # level 5 is proven losing as shadow; instead test whether B or C ALONE is worth posting at level 4
+        sh = level_overrides(4); sh.update(ENSEMBLE_MIN_AGREE=1, ENSEMBLE_ONLY="BC")
+    else: sh = level_overrides(min(lv + 1, 4))
+    sh["OVERLAP_MODE"] = "off"; C.SHADOW_OVERRIDES = sh
     C.CURRENT_LEVEL = int(level)
 
 def analyze_relaxed_ensemble(df, pair, payout=None, gaps=0, x=None):
@@ -333,6 +344,7 @@ def bug_patterns(x):
     big = body > C.BUG_BIG_ATR * np.nan_to_num(atrv, nan=np.inf)
     yield "bigrev", f"after a big candle (> {C.BUG_BIG_ATR} ATR) → next reverses", big & (col != 0), None   # pred = -col
     mins = x.index.minute.values; hrs = x.index.hour.values
+    if not C.BUG_TIME_PATTERNS: return
     for m in range(10):
         yield f"min{m}", f"bars opening at minute :x{m}", (mins % 10) == m, 0
     for h in range(24):
@@ -382,6 +394,118 @@ def bug_prediction(x, key, rule):
         base = -last if p2 is None else p2
         return base * d
     return None
+
+# ---------- NAMED BUG STRATEGIES B1/B2/B3 (EXPERIMENTAL). variant = "improved" (default) | "original" ----------
+def demarker(x, n=14):
+    """DeMarker(n) from closed bars only (causal SMAs)."""
+    dmax = (x.high - x.high.shift()).clip(lower=0); dmin = (x.low.shift() - x.low).clip(lower=0)
+    a, b = dmax.rolling(n).mean(), dmin.rolling(n).mean()
+    return (a / (a + b).replace(0, np.nan)).fillna(0.5)
+
+def _swing_levels(x, i, side):
+    """Confirmed swing highs/lows (2 bars each side) in bars i-LOOKBACK .. i-3, clustered within 0.2 ATR; returns [(level, touches, last_j)]."""
+    a = float(x.atr.iloc[i]); lo = max(2, i - C.B2_LOOKBACK); col = x.high if side == "res" else x.low
+    piv = []
+    for j in range(lo, i - 2):
+        w = col.iloc[j-2:j+3]
+        if (side == "res" and col.iloc[j] == w.max()) or (side == "sup" and col.iloc[j] == w.min()): piv.append((float(col.iloc[j]), j))
+    out = []
+    for lv, j in piv:
+        near = [(l2, j2) for l2, j2 in piv if abs(l2 - lv) <= 0.2*a]
+        if len(near) >= C.B2_TOUCHES: out.append((max(l for l, _ in near) if side == "res" else min(l for l, _ in near), len(near), max(j2 for _, j2 in near)))
+    return out
+
+def bug_B2(x, i, variant=None):
+    """'1m Momentum Gap to S/R': strong candle closing just short of a multi-touch level -> continuation into the level."""
+    v = variant or C.BUG_STRAT_VARIANT; r = x.iloc[i]; a = float(r.atr); rng = r.high - r.low
+    if not np.isfinite(a) or a <= 0 or rng <= 0: return None
+    body = abs(r.close - r.open)
+    if body < C.B2_BODY_ATR*a or body/rng < C.B2_BODY_FRAC: return None
+    green = r.close > r.open; side = "res" if green else "sup"
+    lv = [(l, t, j) for l, t, j in _swing_levels(x, i, side) if (0 < l - r.close <= C.B2_DIST_ATR*a if green else 0 < r.close - l <= C.B2_DIST_ATR*a)]
+    if not lv: return None
+    level, touches, lastj = min(lv, key=lambda t: abs(t[0] - r.close))
+    d = "CALL" if green else "PUT"
+    if v == "improved":
+        pos = (r.close - r.low)/rng
+        if (green and pos < 0.8) or (not green and pos > 0.2): return None                       # close in the top/bottom 20%
+        q = x.iloc[i-1]; prev_strong = (q.close > q.open) == green and abs(q.close - q.open) >= 0.5*a
+        if not (prev_strong or a > 1.1*float(x.atr.iloc[i-5])): return None                      # momentum: 2 strong bodies or ATR expansion
+        for j in range(max(0, i-15), i):                                                          # recent sharp rejection at that level -> skip
+            b = x.iloc[j]; br = b.high - b.low
+            if br <= 0: continue
+            if green and b.high >= level - 0.1*a and (b.high - max(b.open, b.close))/br >= 0.6 and b.close < b.open: return None
+            if not green and b.low <= level + 0.1*a and (min(b.open, b.close) - b.low)/br >= 0.6 and b.close > b.open: return None
+        t, _ = v_trend(x, i)
+        if (t > 0) != green and not ((r.ema_f > r.ema_s) == green): return None                  # trend side must agree
+    return d, f"strong {'green' if green else 'red'} {body/a:.1f} ATR, {abs(level - r.close)/a:.2f} ATR short of {'resistance' if green else 'support'} ({touches} touches)"
+
+def bug_B3(x, i, variant=None):
+    """'3-Point Indicator Desync': confirmed pivot after a >=3-candle push + DeMarker/RSI extreme hooking back -> fade the push.
+    Uses only bars <= i (no repaint): the pivot bar j is in i-3..i-1 and is confirmed by the retrace up to bar i."""
+    v = variant or C.BUG_STRAT_VARIANT; a = float(x.atr.iloc[i])
+    if i < 40 or not np.isfinite(a) or a <= 0: return None
+    dem = x["dem"] if "dem" in x else demarker(x.iloc[:i+1], 14)
+    rsi14 = x["rsi14"] if "rsi14" in x else rsi(x.close.iloc[:i+1], 14)
+    win = x.iloc[i - C.B3_ZZ_DEPTH + 1:i + 1]
+    for side in ("top", "bot"):
+        j = int(np.argmax(win.high.values) if side == "top" else np.argmin(win.low.values)) + i - C.B3_ZZ_DEPTH + 1
+        if not (i - 3 <= j <= i - 1): continue
+        ext = x.high.iloc[j] if side == "top" else x.low.iloc[j]
+        retr = (ext - x.low.iloc[j+1:i+1].min()) if side == "top" else (x.high.iloc[j+1:i+1].max() - ext)
+        if retr < C.B3_ZZ_DEV_ATR * a: continue                                                   # zigzag pivot not confirmed
+        cols = np.sign(x.close.iloc[j - C.B3_PUSH + 1:j + 1].values - x.open.iloc[j - C.B3_PUSH + 1:j + 1].values)
+        if not (cols == (1 if side == "top" else -1)).all(): continue                              # >= 3-candle push into the pivot
+        dz, rz = dem.iloc[j-1:i].max() if side == "top" else dem.iloc[j-1:i].min(), rsi14.iloc[j-1:i].max() if side == "top" else rsi14.iloc[j-1:i].min()
+        extreme = (dz > 0.7 or rz > 70) if side == "top" else (dz < 0.3 or rz < 30)
+        hook = (dem.iloc[i] < dem.iloc[i-1] or rsi14.iloc[i] < rsi14.iloc[i-1]) if side == "top" else (dem.iloc[i] > dem.iloc[i-1] or rsi14.iloc[i] > rsi14.iloc[i-1])
+        if not (extreme and hook): continue
+        if v == "improved":
+            if float(x.adx.iloc[i]) > C.ADX_RANGE + 2: continue                                   # only fade pushes in ranges
+            touch = (x.bb_z.iloc[j] >= 1.8 or x.high.iloc[j] >= x.res.iloc[j-1] - 0.1*a) if side == "top" else \
+                    (x.bb_z.iloc[j] <= -1.8 or x.low.iloc[j] <= x.sup.iloc[j-1] + 0.1*a)
+            div = False
+            for k in range(max(5, j - 30), j - 4):                                                # earlier swing with stronger RSI = divergence
+                if side == "top" and x.high.iloc[k] == x.high.iloc[k-2:k+3].max() and x.high.iloc[k] < ext and rsi14.iloc[k] > rsi14.iloc[j]: div = True; break
+                if side == "bot" and x.low.iloc[k] == x.low.iloc[k-2:k+3].min() and x.low.iloc[k] > ext and rsi14.iloc[k] < rsi14.iloc[j]: div = True; break
+            if not (touch or div): continue
+        return ("PUT" if side == "top" else "CALL"), f"{'top' if side == 'top' else 'bottom'} pivot after {C.B3_PUSH}-candle push, DeMarker {dz:.2f}/RSI {rz:.0f} hooking"
+    return None
+
+def bars5(ticks, end_ts):
+    """5-second OHLC bars from [(t, price)] up to (excluding) end_ts; only fully completed 5 s buckets."""
+    b = {}
+    for t, p in ticks:
+        if t >= end_ts: break
+        k = int(t // 5) * 5; o = b.get(k)
+        if o is None: b[k] = [p, p, p, p]
+        else: o[1] = max(o[1], p); o[2] = min(o[2], p); o[3] = p
+    last_full = int(end_ts // 5) * 5
+    return [(k, *v) for k, v in sorted(b.items()) if k + 5 <= last_full]
+
+def bug_B1(ticks, now_ts, x1=None, variant=None):
+    """'5s Gap Rejection' (stream pairs only): spike/gap or long rejection wick in the last completed 5 s bar -> fade it now."""
+    v = variant or C.BUG_STRAT_VARIANT; sec = now_ts % 60
+    if sec > 50: return None                                                                       # never within 10 s of the candle close
+    bs = bars5(ticks, now_ts)
+    if len(bs) < 36: return None                                                                   # need >= 3 min of 5 s bars
+    hist = bs[-61:-1]; k, o, h, l, c = bs[-1]
+    if hist[-1][0] != k - 5: return None                                                           # tick gap -> insufficient data
+    med = float(np.median([b[2] - b[3] for b in hist]))
+    if med <= 0: return None
+    rng = h - l; gap = o - hist[-1][4]; up = h - max(o, c); lo = min(o, c) - l; d = why = None
+    if rng > 0 and max(up, lo) >= C.B1_WICK_FRAC*rng and max(up, lo) >= C.B1_WICK_X*med:
+        d, why = ("PUT", f"upper rejection wick {up/med:.1f}× median") if up >= lo else ("CALL", f"lower rejection wick {lo/med:.1f}× median")
+    elif rng >= C.B1_SPIKE_X*med or abs(gap) >= C.B1_SPIKE_X*med:
+        mv = (c - hist[-1][4]); d = "PUT" if mv > 0 else "CALL"; why = f"5 s spike {max(rng, abs(gap))/med:.1f}× median"
+    if d is None: return None
+    if v == "improved":
+        if any((b[2] - b[3]) >= 1.5*med for b in bs[-4:-1]): return None                         # spike must be isolated
+        if x1 is not None and len(x1):
+            r = x1.iloc[-1]
+            if float(r.adx) >= C.ADX_TREND: return None                                             # not inside a 1-min trend/breakout
+            if (d == "PUT" and c <= r.ema_f) or (d == "CALL" and c >= r.ema_f): return None         # fade only spikes away from EMA9
+    return d, why, c
 
 # ---------- backtest ----------
 def load_csv(path, pair=None):
