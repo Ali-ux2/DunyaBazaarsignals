@@ -3,6 +3,7 @@
 import os, tempfile, json
 os.environ.update(DOUBLE_CONFIRM="off", NEWS_FILTER="off", BLACKOUT="off", STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv")
 import numpy as np, pandas as pd, config as C, analyzer as A, bot, bugstrats as S
+C.VERBOSE = True   # this test inspects the per-signal bug admin mirror (off by default; feedback log instead)
 from datetime import timedelta
 from telemetry import Telemetry
 rng = np.random.default_rng(7)

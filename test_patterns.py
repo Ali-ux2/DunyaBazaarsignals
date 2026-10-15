@@ -41,6 +41,7 @@ s = bt.bug_fire("*:P7", PR, "PUT", "t", T, .9, x=xx); assert s["silent"] and not
 assert not GRP and bt.p_hist_day.get("P7") == 1 and not any("Filtered by history" in m for m in ADM), "counted, not spammed"
 # history passes → admin alert only (unproven), never the group
 bt.hist_gate = lambda *a, **k: (True, "ok", "seen 40×")
+C.VERBOSE = True   # per-signal bug admin mirror is /verbose-only now
 bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); s = bt.bug_fire("*:P8", PR, "CALL", "t", T, .9, x=xx)
 assert not s["silent"] and not s["group"] and "admin only until proven" in ADM[-1] and not GRP
 bt.bugs["*:P8"]["fw"] = [15, 6]; bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); s = bt.bug_fire("*:P8", list(C.PAIRS)[4], "CALL", "t", T, .9, x=xx)
@@ -52,7 +53,9 @@ assert s["expiry"] == 2 and s["settle_at"] - s["entry_at"] == timedelta(minutes=
 # double-confirm roles
 C.DOUBLE_CONFIRM = True
 ok, txt = P.p_double_confirm(xx, len(xx) - 1, "P7", "PUT"); assert "P7 gives momentum" in txt
+C.VERBOSE = False
 bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); n0 = len(ADM); assert bt.bug_fire("*:P3", list(C.PAIRS)[3], "PUT", "t", T, .9, x=xx) is None and len(ADM) == n0 and bt.dc_day["by_dc"]["pattern P3"] == 1
+C.VERBOSE = True
 # commands / menu / leaderboard
 bt.command("/patterns"); assert "Drops today: single-confirmation 1 (pattern P3 1)" in ADM[-1] and "filtered by history" in ADM[-1]; assert "Candle patterns P: ON" in ADM[-1] and "P13" in ADM[-1] and "2m expiry" in ADM[-1]
 bt.command("/patterns off"); assert not C.PATTERNS_ON and not bot._on("P1"); bt.command("/patterns on"); assert C.PATTERNS_ON

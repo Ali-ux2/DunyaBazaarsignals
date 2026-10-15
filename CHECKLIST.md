@@ -42,3 +42,4 @@
 | test_warmup.py | bug-group warm-up thresholds, 4/h cap, bug-group-only, admin tag, /history days |
 | test_feedback.py | feedback jsonl store, rotation, /feedback, export CSV+JSON, menu, /reset feedback + backup |
 | test_payout_floor.py | NZDUSD 58%/unknown/stale → blocked at candidate + send time, no default payout, refresh while paused, payout in feedback log |
+| test_html.py | all HTML payloads pass a Telegram-like validator; plain-text fallback on 400; bug/shadow channels receive; no per-signal bug/shadow text in admin |

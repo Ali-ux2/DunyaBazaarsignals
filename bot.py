@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd, requests
 import config as C
 import feedback as FB
+import tghtml
 from analyzer import bug_B1, bug_B2, bug_B3, demarker, rsi as _rsi
 from analyzer import (ensemble, analyze_relaxed_ensemble, apply_level, strategies_line, bug_scan, bug_prediction,
                       STRATEGY_NAMES)
@@ -175,10 +176,17 @@ class Telegram:
     def __init__(self):
         self.on = C.TELEGRAM_ENABLED; self.base = f"https://api.telegram.org/bot{C.TELEGRAM_BOT_TOKEN}"; self.offset = None
     def send(self, chat, text, label="group"):
+        bad = tghtml.validate(text)
+        if bad: log.info("[TG html] raw text needed escaping (%s): %s", label, bad[:2])
+        text = tghtml.sanitize(text)   # every HTML message: only allowed tags survive, all other < > & escaped
         if not self.on or not chat: log.info("[TG->%s] %s", label, text.replace("\n", " | ")); return
         try:
             r = requests.post(f"{self.base}/sendMessage", json={"chat_id": chat, "text": text, "parse_mode": "HTML",
                               "disable_web_page_preview": True}, timeout=10)
+            if not r.ok and r.status_code == 400 and tghtml.is_parse_error(r.text):   # fallback: once as plain text
+                log.warning("Telegram HTML parse error to %s (%s); retrying as plain text", label, r.text[:160])
+                r = requests.post(f"{self.base}/sendMessage", json={"chat_id": chat, "text": tghtml.to_plain(text),
+                                  "disable_web_page_preview": True}, timeout=10)
             if not r.ok: log.warning("Telegram send failed %s: %s", r.status_code, r.text[:200])
         except requests.RequestException as e: log.warning("Telegram error: %s", e)
     chats = None   # [(name, chat_id)] current group target(s); set by Bot
@@ -198,8 +206,12 @@ class Telegram:
                 log.info("[TG->%s photo] %s (%s, %d bytes)", lab, caption, path, len(png)); continue
             ok = False
             try:
-                r = requests.post(f"{self.base}/sendPhoto", data={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
+                r = requests.post(f"{self.base}/sendPhoto", data={"chat_id": cid, "caption": tghtml.sanitize(caption), "parse_mode": "HTML"},
                                   files={"photo": (name, png, "image/png")}, timeout=20)
+                if not r.ok and r.status_code == 400 and tghtml.is_parse_error(r.text):
+                    log.warning("sendPhoto %s HTML parse error; retrying caption as plain text", lab)
+                    r = requests.post(f"{self.base}/sendPhoto", data={"chat_id": cid, "caption": tghtml.to_plain(caption)},
+                                      files={"photo": (name, png, "image/png")}, timeout=20)
                 ok = r.ok
                 if not r.ok: log.warning("sendPhoto %s failed %s: %s", lab, r.status_code, r.text[:200])
             except requests.RequestException as e: log.warning("sendPhoto %s error: %s", lab, e)
@@ -237,13 +249,17 @@ class Telegram:
         if not self.on: log.info("[TG %s] %s", method, str(payload)[:200]); return None
         try:
             r = requests.post(f"{self.base}/{method}", json=payload, timeout=10)
+            if not r.ok and r.status_code == 400 and tghtml.is_parse_error(r.text) and "text" in payload:
+                log.warning("%s HTML parse error; retrying as plain text", method)
+                p2 = {k: v for k, v in payload.items() if k != "parse_mode"}; p2["text"] = tghtml.to_plain(payload["text"])
+                r = requests.post(f"{self.base}/{method}", json=p2, timeout=10)
             if not r.ok and "message is not modified" not in r.text: log.warning("%s failed %s: %s", method, r.status_code, r.text[:200])
             return r.json().get("result") if r.ok else None
         except requests.RequestException as e: log.warning("%s error: %s", method, e)
     def admin_kb(self, text, rows, edit_id=None):
         """Inline keyboard to the admin chat; rows = [[(label, callback_data), ...], ...]."""
         mk = {"inline_keyboard": [[{"text": l, "callback_data": d} for l, d in row] for row in rows]}
-        base = {"chat_id": C.TELEGRAM_ADMIN_ID, "text": text, "parse_mode": "HTML", "reply_markup": mk}
+        base = {"chat_id": C.TELEGRAM_ADMIN_ID, "text": tghtml.sanitize(text), "parse_mode": "HTML", "reply_markup": mk}
         if edit_id: return self._kb_call("editMessageText", dict(base, message_id=edit_id))
         return self._kb_call("sendMessage", base)
     def answer_cb(self, cb_id, text=None):
@@ -1580,7 +1596,7 @@ class Bot:
         bugch = [("bug", C.BUG_CHANNEL_ID)] if C.BUG_CHANNEL_ID and not blk and not self.streaks.frozen("bug", now) and not self.dstop_block("bug", now) else []   # bug group: always on (only temporary cooldown/blackout)
         if sig.get("warmup") and bugch: self.warmup_sent.append(now)
         paper = [("shadow", C.SHADOW_CHANNEL_ID)] if C.SHADOW_CHANNEL_ID and not (main or bugch) else []
-        if self.bug_mode != "off" and not paper: self.tg.admin(alert)
+        if self.bug_mode != "off" and not paper and C.VERBOSE: self.tg.admin(alert)   # per-signal bug mirror: feedback log (admin only with /verbose on)
         self.fb("warmup_signal" if sig.get("warmup") else ("paper_signal" if not (main or bugch) else "bug_signal"), alert, source=k, pair=pair, dir=d,
                 blocked=blk or "", payout_candidate=payout, payout_send=pnow, payout_check=pwhy, routed=[c[0] for c in main + bugch + paper])
         if main or bugch or paper:
@@ -1613,7 +1629,7 @@ class Bot:
                 self.tg.group(f"🔄 SWITCH 🐞 BUG {name} {g['traded']} — enter now", chats=g["chats"])
             else: self.tg.group(f"✅ CONFIRMED 🐞 BUG {name} {g['dir']} — enter now", chats=g["chats"])
             self.fb("bug_precheck", f"{g['pair']} opposite {max(opp or 0, 0):.2f} ATR → {g['traded']}", source=g["k"], pair=g["pair"], dir=g["dir"], paper=bool(g.get("paper")))
-            if not g.get("paper"): self.tg.admin(f"🐞 Bug :57 {g['pair']}: opposite candle {max(opp or 0, 0):.2f} ATR → {'SWITCH ' + g['traded'] if g['traded'] != g['dir'] else 'kept ' + g['dir']}")
+            if not g.get("paper") and C.VERBOSE: self.tg.admin(f"🐞 Bug :57 {g['pair']}: opposite candle {max(opp or 0, 0):.2f} ATR → {'SWITCH ' + g['traded'] if g['traded'] != g['dir'] else 'kept ' + g['dir']}")
     def _tick_price(self, pair, t_end):
         b = getattr(self.d, "books", {}).get(pair)
         if b is None or not getattr(b, "ticks", None): return None, None
@@ -1652,7 +1668,7 @@ class Bot:
                     silent=g["silent"], paper=bool(g.get("paper")), group=g["group"])
             if not g["silent"]:
                 strat = b["key"] if b.get("strategy") else b["key"]
-                if not g.get("paper"): self.tg.admin(f"🐞 Bug result {g['pair']}: {'WIN' if win else 'LOSS'} ({o:.5f}→{c:.5f}) · {strat} {g['dir']} {C.hm(g['entry_at'])} {C.TZ_LABEL}"
+                if not g.get("paper") and C.VERBOSE: self.tg.admin(f"🐞 Bug result {g['pair']}: {'WIN' if win else 'LOSS'} ({o:.5f}→{c:.5f}) · {strat} {g['dir']} {C.hm(g['entry_at'])} {C.TZ_LABEL}"
                               f" · fwd {b['fw'][0]}W/{b['fw'][1]}L")
                 if g["group"]:
                     tw = (c > o) == (g["traded"] == "CALL"); res = "WIN" if tw else "LOSS"; lab = self.d.label(g["pair"])
@@ -2360,7 +2376,7 @@ class Bot:
     def summary_text(self, title=None):
         """Full daily summary (real trades + 👻 shadow section). Read-only: resets nothing."""
         lines = [title or f"📊 Daily summary {self.day_date}"]
-        lines.append(f"  🕒 API budget/stats day: {C.reset_local()} → {C.reset_local()} {C.TZ_LABEL}")
+        rl = C.reset_local().replace(f" {C.TZ_LABEL}", ""); lines.append(f"  🕒 API budget/stats day: {rl} → {rl} {C.TZ_LABEL}")
         lines.append(f"  🕗 Trading day (daily loss/profit stops): {C.DAILY_STOP_RESUME} → {C.DAILY_STOP_RESUME} {C.TZ_LABEL}")
         tw = tl = tc = 0
         for p in self.all_pairs:

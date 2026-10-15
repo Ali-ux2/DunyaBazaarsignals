@@ -29,6 +29,7 @@ import numpy as np, analyzer as A
 r = np.random.default_rng(5); c = 1.1 + np.cumsum(r.normal(0, 1e-4, 200)); o = np.r_[c[0], c[:-1]]
 xx = A.compute(pd.DataFrame(dict(open=o, high=np.maximum(o, c) + 3e-5, low=np.minimum(o, c) - 3e-5, close=c), index=pd.date_range("2026-10-15 06:40", periods=200, freq="1min", tz="UTC")))
 P = list(C.PAIRS)[0]
+C.VERBOSE = True   # per-signal bug admin mirror is /verbose-only now
 stub(s(5, 4), NE); sig = b.bug_fire("*:B6_14", P, "PUT", "t", T, .9, x=xx)
 print("warm-up sig:", sig and sig.get("warmup"), sig and sig.get("chats"))
 assert sig["warmup"] and not sig["silent"] and [c[0] for c in sig["chats"]] == ["bug"], "bug group only"
