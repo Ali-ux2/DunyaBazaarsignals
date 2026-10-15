@@ -312,6 +312,41 @@ class StreamAdapter:
             log.info(msg); self._msgs.append(msg)
             if len(self.books[p].bars) >= C.MIN_BARS: self._warm_marks[p] = C.MIN_BARS
 
+    def set_pairs(self, new_pairs, reason=""):
+        """Change the instrument list (max STREAM_MAX_INSTRUMENTS). OTCharts has no 'modify stream' call, so the SAME
+        SSEStream object closes its connection and reopens with the new list (single-stream lock kept). Instant warm-up
+        (1 /v1/candles request) only for ADDED pairs; candles of the others stay in memory. Returns (added, removed)."""
+        from resolver import Resolution
+        new_pairs = list(dict.fromkeys(new_pairs))[:C.STREAM_MAX_INSTRUMENTS]
+        added = [p for p in new_pairs if p not in self.pairs]; removed = [p for p in self.pairs if p not in new_pairs]
+        if not added and not removed: return [], []
+        for p in added:
+            r = (self.rest.res.get(p) if self.rest is not None and getattr(self.rest, "res", None) else None)
+            if not (r and r.symbol): r = Resolution(p, C.symbol_for(p), C.BROKER_BOOK, False, 0, ["default"])
+            self.res[p] = r
+            self.books.setdefault(p, CandleBook()); self._warm_marks.setdefault(p, 0)
+            got = None
+            if self.rest is not None and hasattr(self.rest, "fetch_candles"):
+                try: got = self.rest.fetch_candles(p, C.STREAM_WARMUP_BARS)
+                except Exception as e: log.warning("%s: swap warm-up failed (%s)", p, e)
+            if got is not None and len(got):
+                self.books[p].load(got, overwrite=True); self._msgs.append(f"⚡ Instant warm-up: {p} {len(got)} candles loaded")
+            else: self._msgs.append(f"⏳ Warm-up {p}: REST unavailable; building from ticks")
+            if len(self.books[p].bars) >= C.MIN_BARS: self._warm_marks[p] = C.MIN_BARS
+        self.pairs = new_pairs
+        self.sym2pair = {self.res[p].symbol: p for p in self.pairs if self.res.get(p) and self.res[p].symbol}
+        syms = [self.res[p].symbol for p in self.pairs if self.res.get(p) and self.res[p].symbol]
+        self.dropped -= set(removed)
+        if self.mock:
+            for s in syms:
+                if s not in self.mock.symbols:
+                    self.mock.symbols.append(s); self.mock.p[s] = 10 + 7*len(self.mock.p); self.mock.vol[s] = 0.00012
+            self.mock.disconnect(self.on_event); self.mock.connect(self.on_event, syms)
+        elif self.stream is not None:
+            self.stream.symbols = syms; self.stream.force_reconnect(f"instrument list changed {reason}".strip())
+        log.info("stream instruments now %s (added %s, removed %s)", syms, added, removed)
+        return added, removed
+
     def close(self):
         """Close the stream connection for certain (auto-mode switch back to polling, SIGTERM, exit)."""
         self._stop.set()
@@ -366,7 +401,7 @@ class StreamAdapter:
             if data.get("kind") == "in_use":
                 self._msgs.append("🔴 Stream down: OTCharts says a stream is still open; retrying...")
             elif data.get("kind") == "quota":
-                self._msgs.append("🔴 Stream down: OTCharts daily request quota exhausted; retrying until the 00:00 UTC reset...")
+                self._msgs.append(f"🔴 Stream down: OTCharts daily request quota exhausted; retrying until the reset at {C.reset_local()}...")
             elif first:
                 self._msgs.append(f"🔴 Stream down: connection lost ({data.get('body', '')[:80]}); reconnecting...")
         elif ev == "up":

@@ -13,6 +13,10 @@ OTCHARTS_API_KEY    = _env("OTCHARTS_API_KEY", "OTCHARTS_KEY", "OTC_API_KEY")
 TELEGRAM_BOT_TOKEN  = _env("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = _env("TELEGRAM_CHANNEL_ID", "CHANNEL_ID", "CHAT_ID", "TELEGRAM_CHAT_ID")
 TELEGRAM_ADMIN_ID   = _env("TELEGRAM_ADMIN_ID", "ADMIN_CHAT_ID", "ADMIN_ID")
+# Public / VIP channel switch (optional). VIP falls back to TELEGRAM_CHANNEL_ID (today: DUNYABAZAAR VIP).
+PUBLIC_CHANNEL_ID   = _env("PUBLIC_CHANNEL_ID")
+VIP_CHANNEL_ID      = _env("VIP_CHANNEL_ID", "TELEGRAM_CHANNEL_ID", "CHANNEL_ID", "CHAT_ID", "TELEGRAM_CHAT_ID")
+def channel_ids(): return {"public": PUBLIC_CHANNEL_ID, "vip": VIP_CHANNEL_ID}
 
 # ---- runtime mode ----
 DATA_SOURCE     = _env("DATA_SOURCE", default="otcharts")   # otcharts | replay | mockstream (tests)
@@ -23,6 +27,8 @@ DRY_RUN_MINUTES = int(_env("DRY_RUN_MINUTES", default="0"))  # replay: stop afte
 STATE_DIR       = _env("STATE_DIR", default=".")             # mount a Railway volume here
 STATS_FILE      = os.path.join(STATE_DIR, "pair_stats.json")
 TRADE_LOG       = os.path.join(STATE_DIR, "trades.csv")
+CHANNEL_TARGET_FILE = os.path.join(STATE_DIR, "channel_target.json")
+BENCH_FILE = os.path.join(STATE_DIR, "benched.json")   # pairs benched today after MAX_LOST_LADDERS_PER_DAY lost ladders
 
 # ---- OTCharts ----
 OTCHARTS_BASE   = "https://otcharts.com"
@@ -36,7 +42,7 @@ BUDGET_WARN     = 0.80
 BUDGET_PAUSE    = 0.95
 USAGE_CHECK_SEC = 300
 
-_DEFAULT_PAIRS = ["USDBRL", "USDMXN", "USDINR", "USDPKR", "USDDZD", "USDARS", "USDBDT", "USDCOP", "USDIDR", "USDPHP", "USDEGP", "USDNGN"]
+_DEFAULT_PAIRS = ["USDBRL", "USDMXN", "USDINR", "USDPKR", "USDDZD", "USDARS", "USDBDT", "USDCOP", "USDIDR", "USDPHP", "USDEGP", "USDNGN", "NZDUSD", "USDZAR", "EURNZD"]
 # All 12 enabled; the live payout gate (MIN_PAYOUT 77%) filters low-payout pairs per signal.
 DISABLED_PAIRS: list = []   # move pairs here (and out of _DEFAULT_PAIRS) to disable
 PAIRS = [p.strip().upper() for p in _env("PAIRS", default=",".join(_DEFAULT_PAIRS)).split(",") if p.strip()]
@@ -63,6 +69,21 @@ def symbol_for(pair, book=BROKER_BOOK):
     if book == "binodex": return f"{pair[:3]}/{pair[3:]}-OTC"
     return pair
 
+# ---- display time zone (everything shown to people). Internal logic, candles, OTCharts, budget reset and the
+# daily-stats day boundary stay UTC (00:00 UTC = 03:00 UTC+3).
+DISPLAY_TZ_OFFSET_HOURS = float(_env("DISPLAY_TZ_OFFSET_HOURS", "DISPLAY_TZ", default="3").upper().replace("UTC", "") or 0)
+def _tz_label(h):
+    if h == 0: return "UTC"
+    hh = int(abs(h)); mm = int(round((abs(h) - hh) * 60))
+    return f"UTC{'+' if h > 0 else '-'}{hh}" + (f":{mm:02d}" if mm else "")
+TZ_LABEL = _tz_label(DISPLAY_TZ_OFFSET_HOURS)
+def local(dt):
+    """UTC datetime/Timestamp -> display time (same object type, shifted)."""
+    from datetime import timedelta
+    return dt + timedelta(hours=DISPLAY_TZ_OFFSET_HOURS) if dt is not None else dt
+def hm(dt): return f"{local(dt):%H:%M}"
+def reset_local(): return f"{(24 + DISPLAY_TZ_OFFSET_HOURS) % 24:02.0f}:00 {TZ_LABEL}"
+
 # ---- sessions (optional; "HH:MM-HH:MM" UTC, comma-separated; empty = always on) ----
 SESSIONS_UTC = _env("SESSIONS_UTC", default="")
 
@@ -77,6 +98,7 @@ PRECHECK_SECOND = int(_env("PRECHECK_SECOND", default="57"))
 PC_SMALL_BODY_ATR   = 0.30   # body < 0.30*ATR counts as "small" (neutral, OK)
 PC_STRONG_BODY_ATR  = 0.60   # opposing body >= 0.60*ATR = strongly against -> cancel
 PC_MAX_ADVERSE_ATR  = 0.50   # price moved > 0.50*ATR against the signal -> cancel
+SWITCH_MIN_BODY_ATR = float(_env("SWITCH_MIN_BODY_ATR", default="0.8"))  # direction mode: SWITCH only if the forming candle is clearly opposite (body >= this, in ATR); else keep
 PC_EXHAUST_ATR      = 1.50   # price ran > 1.5*ATR in signal direction -> edge consumed, cancel
 PC_USE_EMA9         = True   # cancel if price crossed back through EMA9
 PC_USE_SIG_MID      = True   # cancel if price crossed back through signal candle midpoint
@@ -136,6 +158,56 @@ SHADOW_OVERRIDES = dict(
     OVERLAP_MODE="off",      # strict log/require: ignored
 )
 
+# ---- frequency LEVELS (1 very conservative … 5 extreme). Level 3 = the strict defaults above. ----
+# Every level keeps MIN_PAYOUT (77%) and gap rejection. Shadow runs one level looser than the current level (capped at 5).
+_LVL_KEYS = ("MIN_CONF", "ADX_TREND", "ADX_RANGE", "ER_TREND", "ATR_PCTL_MIN", "ATR_PCTL_MAX", "SR_MIN_RANGE_ATR",
+             "BODY_MIN", "CHOP_BARS", "ALLOW_CONFLICT", "ENSEMBLE_MIN_AGREE", "ENSEMBLE_STRONG_OPP", "B_BB_Z", "C_WICK_MIN",
+             "ENTRY_MAX_EXT_ATR")
+LEVELS = {
+    1: dict(MIN_CONF=0.75, ADX_TREND=27, ADX_RANGE=17, ER_TREND=0.40, ATR_PCTL_MIN=25, ATR_PCTL_MAX=93, SR_MIN_RANGE_ATR=3.5,
+            BODY_MIN=0.65, CHOP_BARS=3, ALLOW_CONFLICT=False, ENSEMBLE_MIN_AGREE=3, ENSEMBLE_STRONG_OPP=0.40, B_BB_Z=2.0, C_WICK_MIN=0.60,
+            ENTRY_MAX_EXT_ATR=1.5),
+    2: dict(MIN_CONF=0.70, ADX_TREND=25, ADX_RANGE=18, ER_TREND=0.35, ATR_PCTL_MIN=20, ATR_PCTL_MAX=95, SR_MIN_RANGE_ATR=3.0,
+            BODY_MIN=0.60, CHOP_BARS=4, ALLOW_CONFLICT=False, ENSEMBLE_MIN_AGREE=2, ENSEMBLE_STRONG_OPP=0.50, B_BB_Z=1.8, C_WICK_MIN=0.55,
+            ENTRY_MAX_EXT_ATR=1.8),
+    3: dict(MIN_CONF=0.62, ADX_TREND=23, ADX_RANGE=19, ER_TREND=0.30, ATR_PCTL_MIN=15, ATR_PCTL_MAX=96, SR_MIN_RANGE_ATR=2.5,
+            BODY_MIN=0.55, CHOP_BARS=4, ALLOW_CONFLICT=False, ENSEMBLE_MIN_AGREE=2, ENSEMBLE_STRONG_OPP=0.60, B_BB_Z=1.6, C_WICK_MIN=0.50,
+            ENTRY_MAX_EXT_ATR=2.0),
+    4: dict(MIN_CONF=0.55, ADX_TREND=21, ADX_RANGE=20, ER_TREND=0.25, ATR_PCTL_MIN=10, ATR_PCTL_MAX=98, SR_MIN_RANGE_ATR=2.0,
+            BODY_MIN=0.50, CHOP_BARS=5, ALLOW_CONFLICT=True, ENSEMBLE_MIN_AGREE=2, ENSEMBLE_STRONG_OPP=0.70, B_BB_Z=1.4, C_WICK_MIN=0.45,
+            ENTRY_MAX_EXT_ATR=2.5),
+    5: dict(MIN_CONF=0.45, ADX_TREND=18, ADX_RANGE=18, ER_TREND=0.20, ATR_PCTL_MIN=5, ATR_PCTL_MAX=99, SR_MIN_RANGE_ATR=1.5,
+            BODY_MIN=0.45, CHOP_BARS=6, ALLOW_CONFLICT=True, ENSEMBLE_MIN_AGREE=2, ENSEMBLE_STRONG_OPP=0.80, B_BB_Z=1.2, C_WICK_MIN=0.40,
+            ENTRY_MAX_EXT_ATR=3.0),
+}
+DEFAULT_LEVEL = _env("DEFAULT_LEVEL", default="auto").lower()       # 1..5 or auto (default auto, starting at LEVEL_AUTO_START)
+LEVEL_AUTO_START = int(_env("LEVEL_AUTO_START", default="4"))
+MIN_SIGNALS_PER_HOUR = float(_env("MIN_SIGNALS_PER_HOUR", default="4"))   # auto: loosen while the last 60 active minutes are below this
+LEVEL_RATE_CHECK_MIN = 20      # auto: re-check the signal rate every 20 active minutes
+LEVEL_FILE = os.path.join(STATE_DIR, "level.json")
+LEVEL_AUTO_EVERY = 20          # settled real trades between auto evaluations
+LEVEL_AUTO_LOOSEN_MARGIN = 0.05
+LEVEL_AUTO_LOW_RATE = 1.0      # signals/hour over the last 2 h of active time counts as "low"
+LEVEL_AUTO_MIN, LEVEL_AUTO_MAX = 1, 5   # level 5 only while the last 20 trades are at/above breakeven
+for _k, _v in LEVELS[3].items(): globals()[_k] = _v                 # strict defaults = level 3
+ENTRY_CHECK = _env("ENTRY_CHECK", default="1").lower() in ("1", "true", "yes", "on")   # closed candle overextended from EMA9 -> no group signal
+STRATEGY_STATS_FILE = os.path.join(STATE_DIR, "strategy_stats.json")
+
+# ---- bug / glitch watcher (EXPERIMENTAL, admin only) ----
+BUG_WATCH = _env("BUG_WATCH", default="1").lower() in ("1", "true", "yes", "on")
+BUG_FILE = os.path.join(STATE_DIR, "bug_watch.json")
+BUG_MIN_SAMPLES = 20
+BUG_MIN_RATE = 0.65
+BUG_MAX_P = 0.01               # one-sided binomial p-value vs 50% (keeps random data from triggering)
+BUG_SCAN_MIN = 5               # non-stream pairs: re-scan history every N minutes (only candles already fetched)
+BUG_STREAM_MIN_SAMPLES = 15     # live stream pairs: scanned every closed candle with a lower sample minimum
+BUG_PROMOTE_MIN_FW = 20         # daily review: forward paper trades needed to promote/demote
+BUG_PROMOTE_MARGIN = 0.05       # promote to 'candidate' at >= breakeven + 5 pts
+BUG_ALERT_COOLDOWN_H = 6       # same pattern on the same pair alerts at most once per 6 h
+BUG_MAX_ALERTS_PER_HOUR = 3
+BUG_BIG_ATR = 1.2
+BUG_SAME_BODY_FRAC = 0.05      # identical consecutive bodies on >= 5% of bars (and >= BUG_MIN_SAMPLES) = glitch
+
 # ---- payout / pair management (NO martingale) ----
 MIN_PAYOUT = 0.77        # never signal below 77%
 DEFAULT_PAYOUT = 0.85    # used in replay / when book gives no payout
@@ -159,11 +231,14 @@ PERSIST_CANDLES = 300
 CANDLE_DIR = os.path.join(STATE_DIR, "candles")
 PAYOUT_CACHE = os.path.join(STATE_DIR, "payouts.json")
 RESOLUTION_CACHE = os.path.join(STATE_DIR, "resolutions.json")
+ALL_PAIRS = list(PAIRS)            # full list, kept for /poll even when started with MODE=stream
+MODE_CHOICE_FILE = os.path.join(STATE_DIR, "mode_choice.json")
 if MODE == "stream": PAIRS = list(STREAM_PAIRS)
 
 def missing_secrets():
     need = {"OTCHARTS_API_KEY": OTCHARTS_API_KEY if DATA_SOURCE == "otcharts" else "n/a"}
     if TELEGRAM_ENABLED:
-        need.update(TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID=TELEGRAM_CHANNEL_ID,
+        need.update(TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN,
+                    TELEGRAM_CHANNEL_ID=TELEGRAM_CHANNEL_ID or VIP_CHANNEL_ID or PUBLIC_CHANNEL_ID,
                     TELEGRAM_ADMIN_ID=TELEGRAM_ADMIN_ID)
     return [k for k, v in need.items() if not v]

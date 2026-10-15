@@ -125,6 +125,18 @@ def precheck(sig, f_open, price):
     if body < C.PC_SMALL_BODY_ATR*a: return True, "small opposing body"
     return False, "opposing candle, not confirmed"
 
+def switch_body_atr(sig, f_open, price):
+    """Forming-candle body AGAINST the signal, in ATR (<= 0 means with the signal or doji)."""
+    d = 1 if sig["signal"] == "CALL" else -1
+    return -d*(price - f_open)/(sig["atr"] or 1e-12)
+
+def switch_kind(sig, f_open, price, ok, reason):
+    """Final :57 decision for direction mode: None = keep, else 'momentum'/'reversion'.
+    Any switch requires a clearly opposite forming candle: body >= SWITCH_MIN_BODY_ATR."""
+    k = precheck_flip_kind(ok, reason)
+    if k is not None and switch_body_atr(sig, f_open, price) < C.SWITCH_MIN_BODY_ATR: return None
+    return k
+
 def precheck_flip_kind(ok, reason):
     """For PRECHECK_MODE='direction': None = keep the signal direction; else why we SWITCH.
     momentum  : forming candle strongly opposes (strong body / moved >0.5 ATR against / crossed back) -> follow it
@@ -204,6 +216,173 @@ def analyze_relaxed(df, pair, payout=None, gaps=0, x=None):
     with _overrides(C.SHADOW_OVERRIDES):
         return analyze(df, pair, payout=payout, gaps=gaps, x=x, use_gate=False)
 
+# ---------- ENSEMBLE: independent strategies, each -> (direction "CALL"/"PUT", score 0..1) or None ----------
+def _ctx(x, i, pair, p):
+    r = x.iloc[i]
+    return {"pair": pair, "support": float(r.sup), "resistance": float(r.res), "atr": float(r.atr), "ema9": float(r.ema_f),
+            "sig_mid": float((r.high + r.low)/2), "sig_close": float(r.close), "adx": round(float(r.adx), 1), "er": round(float(r.er), 2),
+            "payout": p, "breakeven": round(breakeven(p), 4)}
+
+def strat_trend_pullback(x, i):
+    """A: EMA9/21 trend with ADX, pullback touched EMA9 in the last 3 bars, closed back with the trend."""
+    r = x.iloc[i]; w = x.iloc[i-2:i+1]
+    if r.adx < C.ADX_TREND: return None
+    sc = min(1.0, 0.5 + (r.adx - C.ADX_TREND)/30 + 0.2*min(r.er, 1))
+    if r.ema_f > r.ema_s and r.close > r.ema_f and r.close > r.open and (w.low <= w.ema_f).any(): return "CALL", round(sc, 2)
+    if r.ema_f < r.ema_s and r.close < r.ema_f and r.close < r.open and (w.high >= w.ema_f).any(): return "PUT", round(sc, 2)
+    return None
+
+def strat_range_reversion(x, i):
+    """B: ranging market (ADX low), price stretched to a Bollinger extreme with momentum exhaustion (RSI/Stoch)."""
+    r, q = x.iloc[i], x.iloc[i-1]
+    if r.adx > C.ADX_RANGE + 2 or not np.isfinite(r.bb_z): return None
+    sc = lambda z: round(min(1.0, 0.5 + (abs(z) - C.B_BB_Z)/2), 2)
+    if r.bb_z <= -C.B_BB_Z and (r.rsi < 35 or r.k < 20) and r.k >= q.k: return "CALL", sc(r.bb_z)
+    if r.bb_z >= C.B_BB_Z and (r.rsi > 65 or r.k > 80) and r.k <= q.k: return "PUT", sc(r.bb_z)
+    return None
+
+def strat_sr_rejection(x, i):
+    """C: pin/wick rejection candle at support/resistance (level within 0.3 ATR, long wick, close away from level)."""
+    r = x.iloc[i]; rng = r.high - r.low
+    if rng <= 0 or (r.res - r.sup) < C.SR_MIN_RANGE_ATR * r.atr: return None
+    lo = (min(r.open, r.close) - r.low)/rng; up = (r.high - max(r.open, r.close))/rng
+    sup_prev, res_prev = x.sup.iloc[i-1], x.res.iloc[i-1]
+    if lo >= C.C_WICK_MIN and r.low <= sup_prev + 0.3*r.atr and r.close > (r.high + r.low)/2: return "CALL", round(min(1.0, lo + 0.2), 2)
+    if up >= C.C_WICK_MIN and r.high >= res_prev - 0.3*r.atr and r.close < (r.high + r.low)/2: return "PUT", round(min(1.0, up + 0.2), 2)
+    return None
+
+def strat_voting(x, i, pair, p):
+    """D: the original regime-aware voting engine (analyze) as one member."""
+    s = analyze(None, pair, payout=p, x=x, i=i, use_gate=False)
+    return ((s["signal"], round(s["confidence"]/100, 2)) if s["signal"] else None), s
+
+STRATEGY_NAMES = {"A": "trend-pullback", "B": "range-reversion", "C": "S/R-rejection", "D": "voting-engine"}
+
+def ensemble(df, pair, payout=None, x=None, i=None, gaps=0, use_gate=True):
+    """Group signal: >= ENSEMBLE_MIN_AGREE strategies on one direction and no opposing strategy with score >= ENSEMBLE_STRONG_OPP.
+    Shared gates first: history, 77% payout floor, gap rejection, warm-up, ATR percentile, pair win-rate gate, entry extension."""
+    if x is None: x = compute(df)
+    if i is None: i = len(x)-1
+    p = C.DEFAULT_PAYOUT if payout is None else payout
+    if i + 1 < C.MIN_BARS: return {"signal": None, "reject": "not enough history"}
+    if p < C.MIN_PAYOUT: return {"signal": None, "reject": f"payout {p:.0%} < min {C.MIN_PAYOUT:.0%}"}
+    if gaps > C.MAX_GAP_RUNS: return {"signal": None, "reject": f"feed gaps ({gaps})"}
+    r = x.iloc[i]
+    if not np.isfinite([r.atr, r.atr_pctl, r.bb_z]).all(): return {"signal": None, "reject": "warming up"}
+    if r.atr_pctl < C.ATR_PCTL_MIN: return {"signal": None, "reject": "volatility too low"}
+    if r.atr_pctl > C.ATR_PCTL_MAX: return {"signal": None, "reject": "volatility spike"}
+    if use_gate and (g := tracker.gate(pair, p)): return {"signal": None, "reject": g}
+    d_vote, d_full = strat_voting(x, i, pair, p)
+    votes = {"A": strat_trend_pullback(x, i), "B": strat_range_reversion(x, i), "C": strat_sr_rejection(x, i), "D": d_vote}
+    calls = {k: v for k, v in votes.items() if v and v[0] == "CALL"}; puts = {k: v for k, v in votes.items() if v and v[0] == "PUT"}
+    if not calls and not puts: return {"signal": None, "reject": "no strategy fired", "strategies": votes}
+    side, agree, opp = ("CALL", calls, puts) if len(calls) > len(puts) or (len(calls) == len(puts) and
+                       sum(v[1] for v in calls.values()) >= sum(v[1] for v in puts.values())) else ("PUT", puts, calls)
+    if len(agree) < C.ENSEMBLE_MIN_AGREE:
+        return {"signal": None, "reject": f"only {len(agree)} strategy agrees (need {C.ENSEMBLE_MIN_AGREE})", "strategies": votes}
+    strong = [k for k, v in opp.items() if v[1] >= C.ENSEMBLE_STRONG_OPP]
+    if strong: return {"signal": None, "reject": f"strong opposing strategy {','.join(strong)}", "strategies": votes}
+    ext = abs(r.close - r.ema_f)/(r.atr or 1e-12)
+    if C.ENTRY_CHECK and ext > C.ENTRY_MAX_EXT_ATR:
+        return {"signal": None, "reject": f"entry overextended: close {ext:.1f} ATR from EMA9 (> {C.ENTRY_MAX_EXT_ATR})", "strategies": votes}
+    conf = sum(v[1] for v in agree.values())/len(agree)
+    out = _ctx(x, i, pair, p)
+    out.update(signal=side, strategies=votes, agree=sorted(agree), oppose=sorted(opp), confidence=round(conf*100),
+               score=round(sum(v[1] for v in agree.values()), 2), max_score=len(votes),
+               regime=d_full.get("regime") or regime(r), overlap=(overlap_ok(x, i, side) if C.OVERLAP_MODE != "off" else None),
+               votes=d_full.get("votes", {}), reasons=[f"{k} {STRATEGY_NAMES[k]} {v[1]:.2f}" for k, v in sorted(agree.items())])
+    return out
+
+def strategies_line(s):
+    v = s.get("strategies") or {}
+    return " · ".join(f"{k}:{(x[0] + ' ' + format(x[1], '.2f')) if x else '—'}" for k, x in sorted(v.items()))
+
+def level_overrides(level):
+    lv = dict(C.LEVELS[max(1, min(5, int(level)))])
+    return lv
+
+def apply_level(level):
+    """Main thread only: set the strict thresholds to a level; shadow = one level looser (capped at 5), overlap ignored."""
+    for k, v in level_overrides(level).items(): setattr(C, k, v)
+    sh = level_overrides(min(5, int(level) + 1)); sh["OVERLAP_MODE"] = "off"; C.SHADOW_OVERRIDES = sh
+    C.CURRENT_LEVEL = int(level)
+
+def analyze_relaxed_ensemble(df, pair, payout=None, gaps=0, x=None):
+    with _overrides(C.SHADOW_OVERRIDES):
+        return ensemble(df, pair, payout=payout, gaps=gaps, x=x, use_gate=False)
+
+# ---------- BUG / GLITCH WATCHER (EXPERIMENTAL) ----------
+def _binom_p(k, n):
+    """One-sided P(X >= k) for X ~ Bin(n, 0.5)."""
+    if n <= 0: return 1.0
+    return sum(math.comb(n, j) for j in range(k, n+1)) / 2**n
+
+def bug_patterns(x):
+    """Yield (key, description, cond_mask[np.bool], prediction[+1 green/-1 red or 0 = 'test both']) over closed bars of x.
+    The outcome is the NEXT bar's colour; dojis are excluded."""
+    o, c = x.open.values, x.close.values; col = np.sign(c - o).astype(int); n = len(col)
+    body = np.abs(c - o); atrv = x.atr.values
+    for k in (3, 4, 5):
+        for X, nm in ((1, "greens"), (-1, "reds")):
+            m = np.ones(n, bool)
+            for j in range(k): m &= np.r_[np.zeros(j, bool), col[:n-j] == X] if j else (col == X)
+            yield f"run{k}{'G' if X == 1 else 'R'}", f"after {k} {nm}", m, -X
+    alt = np.zeros(n, bool)
+    alt[3:] = (col[3:] != 0) & (col[3:] == -col[2:-1]) & (col[2:-1] == -col[1:-2]) & (col[1:-2] == -col[:-3])
+    yield "alt4", "after 4 alternating (RGRG/GRGR) → alternation continues", alt, None   # pred = -col (continue)
+    big = body > C.BUG_BIG_ATR * np.nan_to_num(atrv, nan=np.inf)
+    yield "bigrev", f"after a big candle (> {C.BUG_BIG_ATR} ATR) → next reverses", big & (col != 0), None   # pred = -col
+    mins = x.index.minute.values; hrs = x.index.hour.values
+    for m in range(10):
+        yield f"min{m}", f"bars opening at minute :x{m}", (mins % 10) == m, 0
+    for h in range(24):
+        yield f"hour{h:02d}", f"bars in hour {h:02d}:00 UTC", hrs == h, 0
+
+def bug_scan(x, min_samples=None):
+    ms = min_samples or C.BUG_MIN_SAMPLES
+    """Return [(key, desc, pred_rule, rate, n)] for patterns beating BUG_MIN_RATE with >= BUG_MIN_SAMPLES and p < BUG_MAX_P/tests.
+    Colour patterns test the bar itself for minute/hour buckets (pred 0) and the NEXT bar otherwise."""
+    o, c = x.open.values, x.close.values; col = np.sign(c - o).astype(int); n = len(col)
+    nxt = np.r_[col[1:], 0]; cands = []; tests = 0
+    for key, desc, mask, pred in bug_patterns(x):
+        mask = mask.copy(); mask[-1] = False if pred != 0 else mask[-1]
+        if pred == 0:            # bucket colour bias: outcome = the bar's own colour
+            out = col[mask]; out = out[out != 0]; nn = len(out)
+            if nn < ms: continue
+            g = int((out == 1).sum()); k, d = (g, 1) if g >= nn - g else (nn - g, -1)
+        else:
+            want = (-col if pred is None else np.full(n, pred))[mask]; out = nxt[mask]
+            ok = out != 0; want, out = want[ok], out[ok]; nn = len(out)
+            if nn < ms: continue
+            hit = int((out == want).sum()); k, d = (hit, 1) if hit >= nn - hit else (nn - hit, -1)
+        rate = k/nn; tests += 1
+        if rate >= C.BUG_MIN_RATE: cands.append((key, desc, (pred, d), round(rate, 3), nn, _binom_p(k, nn)))
+    # Bonferroni: ~50 patterns are tested per pair, so each must beat BUG_MAX_P / tests (stops random data from alerting)
+    found = [c_[:5] for c_ in cands if c_[5] < C.BUG_MAX_P / max(tests, 1)]
+    # identical consecutive bodies (glitch, info only)
+    rel = np.abs(np.diff(np.abs(c - o))) <= 1e-9*np.maximum(np.abs(c[1:]), 1)
+    nz = (np.abs(c - o)[1:] > 0)
+    same = int((rel & nz).sum())
+    if same >= C.BUG_MIN_SAMPLES and same/max(n-1, 1) >= C.BUG_SAME_BODY_FRAC:
+        found.append(("samebody", f"identical consecutive candle bodies on {same/(n-1):.0%} of bars", None, round(same/(n-1), 3), same))
+    return found
+
+def bug_prediction(x, key, rule):
+    """For an active pattern: predicted colour (+1/-1) for the NEXT bar if the latest closed bar matches, else None."""
+    if rule is None: return None
+    pred, d = rule
+    for k2, _, mask, p2 in bug_patterns(x.iloc[-30:]):
+        if k2 != key: continue
+        if p2 == 0:              # bucket pattern: predict the next bar's colour if the next bar falls in the bucket
+            nt = x.index[-1] + pd.Timedelta("60s")
+            inb = (nt.minute % 10 == int(key[3:])) if key.startswith("min") else (nt.hour == int(key[4:]))
+            return d if inb else None
+        if not mask[-1]: return None
+        last = int(np.sign(x.close.iloc[-1] - x.open.iloc[-1]))
+        base = -last if p2 is None else p2
+        return base * d
+    return None
+
 # ---------- backtest ----------
 def load_csv(path, pair=None):
     df = pd.read_csv(path); df.columns = [c.lower() for c in df.columns]
@@ -235,7 +414,7 @@ def backtest(df, pair="TEST", payout=C.DEFAULT_PAYOUT, use_gate=False, log_path=
         ent, ex = x.open.iloc[e], x.close.iloc[e+E-1]
         win = bool(ex > ent if s["signal"] == "CALL" else ex < ent)
         cancelled = pm == "confirm" and pc_ok is False
-        flipped = pm == "direction" and precheck_flip_kind(pc_ok, pc_why) is not None
+        flipped = pm == "direction" and switch_kind(s, f.open, f.close, pc_ok, pc_why) is not None
         if flipped: win = bool(ex < ent if s["signal"] == "CALL" else ex > ent) and ex != ent
         if not cancelled: tracker.record(pair, win)
         trades.append({"time": str(x.index[i]), "dir": s["signal"], "regime": s["regime"], "payout": p, "win": win,

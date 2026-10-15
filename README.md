@@ -18,6 +18,14 @@ Files: `analyzer.py` (signal engine + backtest), `config.py` (all settings), `bo
 | `PRECHECK_SECOND` | | default `57` |
 | `PAIRS` | | optional comma list, default: all 12 pairs |
 | `SHADOW_RELAXED` | | `1` (default) runs the relaxed shadow engine (admin chat only, never posted); `0` turns it off |
+| `PUBLIC_CHANNEL_ID` | | optional: public channel (e.g. Dunya Bazaar Signals) for `/public` / `/both` |
+| `VIP_CHANNEL_ID` | falls back to `TELEGRAM_CHANNEL_ID` | optional: VIP channel. Default target is VIP if set, else PUBLIC |
+| `SWITCH_MIN_BODY_ATR` | | default `0.8`: the :57 check SWITCHes only on a clearly opposite forming candle (body ≥ 0.8 ATR) |
+| `DISPLAY_TZ_OFFSET_HOURS` | `DISPLAY_TZ` | default `3`: every time shown in Telegram (cards, :57, results, admin logs, summaries) is UTC+3 |
+| `DEFAULT_LEVEL` | | `auto` (default, starts at `LEVEL_AUTO_START`=4) or `1`–`5`; `/level` changes it at runtime |
+| `MIN_SIGNALS_PER_HOUR` | | default `4`: AUTO loosens (up to level 5, only while win rate ≥ breakeven) until this rate is met |
+| `ENTRY_CHECK` | | default `1`: no group signal if the closed candle closed > level's ATR distance from EMA9 (overextended) |
+| `BUG_WATCH` | | default `1`: experimental bug/glitch watcher (admin only) |
 | `STATE_DIR` | | optional; point at a Railway Volume mount so `pair_stats.json` survives redeploys |
 | `DATA_SOURCE`, `REPLAY_CSV`, `TELEGRAM_ENABLED`, `DRY_RUN_MINUTES` | | testing only |
 
@@ -25,7 +33,7 @@ If a required one is missing the bot logs `Missing required env vars: ...` and e
 The bot must be an admin of the channel to post. Deploy as a worker (Procfile `worker: python bot.py`).
 
 ## Admin commands (from TELEGRAM_ADMIN_ID only)
-`/pause`, `/resume`, `/status`, `/shadow` (relaxed shadow stats: per-pair W/L, win rate vs breakeven), `/test` (alias `/testcard`: posts one sample card to the group, headed `🧪 TEST CARD — NOT A LIVE SIGNAL`; no stats/trades/cooldowns touched), `/help`. Stop the Railway service between sessions, or use `/pause` / `SESSIONS_UTC`.
+`/pause`, `/resume`, `/status`, `/stats` (today's full summary on demand, nothing reset), `/mode` + `/stream` `/poll` `/auto` (runtime mode), `/channel` + `/public` `/vip` `/both` (where group posts go), `/shadow` (relaxed shadow stats: per-pair W/L, win rate vs breakeven), `/test` (alias `/testcard`: posts one sample card to the group, headed `🧪 TEST CARD — NOT A LIVE SIGNAL`; no stats/trades/cooldowns touched), `/help`. Stop the Railway service between sessions, or use `/pause` / `SESSIONS_UTC`.
 
 
 Filters were eased slightly (midway toward the shadow thresholds) for more group signals; payout floor, gap rejection and :57 never-skip are unchanged.
@@ -174,3 +182,85 @@ after the switch to stream, shadows on non-stream pairs may end `UNKNOWN`. One o
 - OTCharts has no endpoint to list or close streams (no DELETE, no stream id). The slot is freed when the connection closes.
   The limit is per ACCOUNT across all keys, so any other program/deploy holding a stream with the same account blocks this one.
   On Railway, turn off overlapping deploys (or expect up to a few retries during a redeploy while the old container shuts down).
+
+## :57 switch rule (direction mode)
+The :57 line is always ✅ CONFIRMED or 🔄 SWITCH (never a skip). It SWITCHes only when the forming candle is clearly against the
+signal: opposite body ≥ `SWITCH_MIN_BODY_ATR` (0.8 ATR). This applies to every switch reason (momentum and reversion).
+A weaker opposite candle or a doji keeps the original direction; the admin log says e.g. `opposite candle 0.53 ATR < 0.8 → kept PUT`.
+
+## /stats
+Sends today's full summary right away (per-pair W/L, win rate, skips, prechecks, :57 switches, API budget, compounding
+active and eligibility, 👻 shadow section). Read-only: the midnight summary and resets work as before.
+
+## Public / VIP channel switch
+`/public`, `/vip`, `/both` choose where group posts go (signal card, :57 line, result photo, /test card); `/channel` shows the target.
+The choice is saved in `STATE_DIR/channel_target.json`. An open trade keeps the channel(s) its signal card went to for its :57 line
+and result, even if you switch mid-trade. Choosing a channel whose ID isn't set is refused and nothing changes.
+
+## Runtime mode: /stream, /poll, /auto, /mode
+`/stream` switches now to the live stream (STREAM_PAIRS, instant warm-up); `/poll` switches now to polling all PAIRS (stream closed
+cleanly; refused at/over the 95% stop threshold, warned over 93%); `/auto` returns to automatic switching; `/mode` shows the mode,
+manual/auto and budget. A manual choice stays until `/auto` (saved in `STATE_DIR/mode_choice.json`; env `MODE` is only the startup
+default). Safety: in manual POLL, hitting the 95% threshold falls back to the stream automatically and tells you. A switch requested
+during an open trade runs after it settles. Every switch reuses the single-stream close/lock, so two streams never exist.
+
+## Benched pairs and stream swap
+A pair with 2 lost ladders today is benched: no signals for the rest of the UTC day (poll and stream mode), saved in
+`STATE_DIR/benched.json`. If it was in the live stream, it is replaced by the best non-benched pair that is open on Quotex with a cached
+payout ≥ 77% (highest payout first, then fewer losses today, then better win rate; USDBRL stays eligible):
+`🔄 Stream swap: USDINR OUT (2 lost ladders) → USDPHP IN (payout 84%)`. The stream is closed and reopened with the new list
+(OTCharts has no "change instruments" call) and only the new pair gets the instant warm-up (1 request). With no eligible replacement
+it streams 4 pairs and says so. After 00:00 UTC benched pairs return and the stream goes back to STREAM_PAIRS.
+
+## Time zone
+Everything shown in Telegram uses `DISPLAY_TZ_OFFSET_HOURS` (default 3, labelled `UTC+3`): signal card entry/expiry, :57 lines,
+results, admin rounds, stream swaps, /mode, /stats and the daily summary. Internally everything stays UTC (candles, OTCharts).
+The OTCharts budget resets at 00:00 UTC = **03:00 UTC+3**, and the daily-stats day also runs 03:00 → 03:00 UTC+3 so both match.
+Railway log timestamps stay UTC.
+
+## /commands (alias /help) and the Telegram Menu
+`/commands` lists every admin command grouped (Control, Stats, Channels, Mode, Test). At startup the same list is registered with
+Telegram `setMyCommands`, scoped to the admin chat only (BotCommandScopeChat = TELEGRAM_ADMIN_ID), so it appears under the Menu button
+there and nowhere else. The list and the handlers come from one table in bot.py, so they always match.
+
+## Frequency levels (/level)
+`/level` shows the current level and every level's thresholds; `/level 1`…`/level 5` sets it; `/level auto` lets the bot choose
+(saved in `STATE_DIR/level.json`). Every level keeps the 77% payout floor, gap rejection and the :57 0.8 ATR switch rule.
+The 👻 shadow engine always runs one level looser (capped at 5).
+
+| Level | conf | ADX trend/range | ER | ATR pctl | S/R | body | agree | strong-opp | conflict | max ext. from EMA9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 very conservative | 0.75 | 27/17 | 0.40 | 25–93 | 3.5 | 0.65 | 3 | 0.40 | no | 1.5 ATR |
+| 2 conservative | 0.70 | 25/18 | 0.35 | 20–95 | 3.0 | 0.60 | 2 | 0.50 | no | 1.8 ATR |
+| 3 balanced (default) | 0.62 | 23/19 | 0.30 | 15–96 | 2.5 | 0.55 | 2 | 0.60 | no | 2.0 ATR |
+| 4 aggressive (≈ old shadow) | 0.55 | 21/20 | 0.25 | 10–98 | 2.0 | 0.50 | 2 | 0.70 | yes | 2.5 ATR |
+| 5 extreme | 0.45 | 18/18 | 0.20 | 5–99 | 1.5 | 0.45 | 2 | 0.80 | yes | 3.0 ATR |
+
+**Default is AUTO, starting at level 4** (`DEFAULT_LEVEL=auto`, `LEVEL_AUTO_START=4`). Target: `MIN_SIGNALS_PER_HOUR` (default 4).
+Every 20 active (unpaused) minutes AUTO counts the signals in the last 60 active minutes; below the target it loosens one level
+(up to 5). Level 5 is only used while the last 20 settled trades are at/above breakeven 1/(1+avg payout); otherwise it stays at 4
+and tells you once: `⚠️ Target 4/h needs level 5 but win rate below breakeven; staying at 4`. Every 20 settled real trades it also
+checks the win rate: below breakeven → one level stricter (never below 1). /status and /level show signals/hour vs the target.
+Note: more signals per hour means looser filters; on random-walk test data looser levels did not win more often.
+Every change is announced in the admin chat.
+
+## Strategy ensemble (/strategies)
+Four independent strategies vote on each closed candle (same candles, no extra requests):
+A trend-pullback (EMA9/21 + ADX, pullback to EMA9), B range mean-reversion (low ADX, Bollinger extreme + RSI/Stoch exhaustion),
+C S/R rejection (long wick at support/resistance), D the original voting engine. A group signal needs at least `agree` strategies
+on the same side (2 by default, 3 at level 1) and no opposing strategy with score ≥ `strong-opp`. The admin "Sent" message and round
+log show who agreed. Each strategy is scored on its own direction whenever it voted on a traded signal (/strategies, /stats).
+Entry is still the open of the next candle after the closed signal candle: there is no "best entry price" prediction. The only
+entry filter is `ENTRY_CHECK`: a signal candle that closed too far from EMA9 (overextended) is not posted (the shadow may still log it).
+
+## Bug / glitch watcher (/bugs) — EXPERIMENTAL, admin only
+Using candles already in memory, the bot looks for statistical oddities per pair: colour runs (after 3/4/5 reds or greens),
+alternation (RGRG), big-candle reversals (> 1.2 ATR), minute-of-10 and hour-of-day colour bias, and identical consecutive bodies
+(feed glitch). A pattern alerts (`🐞 Bug watch (experimental): USDBRL after 3 reds → next green 74% (129 samples)`) only with
+≥ 20 samples, ≥ 65% and a binomial p-value below 0.01 divided by the ~50 patterns tested per pair, so random data stays quiet
+(0 of 20 random series triggered in tests; small edges like 71% of 24 do NOT pass). Live stream pairs are scanned every closed
+candle (minimum 15 samples); other pairs every 5 minutes from candles already fetched. Max 3 alerts/hour, same pattern once per 6 h.
+Found patterns are paper-traded forward (W/L) and never posted to the group.
+Daily bug review at 00:00 UTC (03:00 UTC+3): forward W/L vs breakeven per pattern; ≥ 20 forward trades at ≥ breakeven + 5 pts →
+CANDIDATE (kept across days); a candidate falling below breakeven → back to watch; a non-candidate below breakeven → dropped.
+Candidates are information for you only; nothing is auto-posted. Saved in `STATE_DIR/bug_watch.json`.

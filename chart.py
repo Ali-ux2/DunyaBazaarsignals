@@ -6,6 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import pandas as pd
+import config as C
 
 BRAND_FOOTER = "🌍 DunyaBazaar"
 CONTACT = "CONTACT : @DBSdesk"
@@ -25,7 +26,7 @@ def signal_caption(symbol: str, direction: str, entry_at, expiry_min: int, playb
                    wait_line: str | None = None) -> str:
     arrow = "🟢 CALL ⬆️" if direction == "CALL" else "🔴 PUT ⬇️"
     lines = ["🚀 Signal ready", "------ { DUNYABAZAAR } ------", f"<b>{display_name(symbol)}</b>  {arrow}",
-             f"⏰ Entry {entry_at:%H:%M}:00 UTC · ⌛ {expiry_min} min"]
+             f"⏰ Entry {C.hm(entry_at)}:00 {C.TZ_LABEL} · ⌛ {expiry_min} min (ends {C.hm(entry_at + pd.Timedelta(minutes=expiry_min))})"]
     if playbook:
         lines += [f"▶️ {playbook[0]}", playbook[1], wait_line or f"Wait for ✅ CONFIRMED at :{precheck_second}"]
     lines += ["------------------------------", CONTACT]
