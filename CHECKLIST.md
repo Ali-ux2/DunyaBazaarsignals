@@ -43,3 +43,16 @@
 | test_feedback.py | feedback jsonl store, rotation, /feedback, export CSV+JSON, menu, /reset feedback + backup |
 | test_payout_floor.py | NZDUSD 58%/unknown/stale → blocked at candidate + send time, no default payout, refresh while paused, payout in feedback log |
 | test_html.py | all HTML payloads pass a Telegram-like validator; plain-text fallback on 400; bug/shadow channels receive; no per-signal bug/shadow text in admin |
+
+## Streak stats (2026-10-15)
+- [x] PASS Streaks section in /stats + daily summary (admin only), per stream main/bug/shadow — test_streaks.py
+- [x] PASS current streak, longest W/L today (08:00 UTC+3) / 7d / 30d, P(L|L) vs loss rate with n
+- [x] PASS draws ignored; empty history; out-of-order records sorted by close time
+- [x] PASS full suite 28/28 scripts
+
+## Double-confirmation paper-scoring (2026-10-15)
+- [PASS] drops queued with entry = next minute, deduped per source/pair/dir/minute (test_dc_paper.py)
+- [PASS] scored WIN/LOSS/TIE from cached candle, logged as drop_single_confirmation_result with failed check + payout
+- [PASS] silent: nothing sent to admin/groups/shadow
+- [PASS] /confirm2 and /filters show passed vs dropped with n, Wilson LB, BE
+- [PASS] full suite 29/29

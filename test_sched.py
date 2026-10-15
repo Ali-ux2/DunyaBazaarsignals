@@ -1,7 +1,7 @@
 """Scheduled posts + event hooks: UTC+3 time triggers (daily/once/weekdays), capture of sticker/photo/forward, forward/copy/pin
 API calls, rate limiting, error reporting (pin permission), session start/close + daily target + first bug signal hooks."""
 import os, tempfile, json, time
-os.environ.update(DOUBLE_CONFIRM="off", NEWS_FILTER="off", BLACKOUT="off", STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv",
+os.environ.update(DOUBLE_CONFIRM="off", NEWS_FILTER="off", BLACKOUT="off", HIST_GATE="off", STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv",
                   PUBLIC_CHANNEL_ID="-100111", VIP_CHANNEL_ID="-100222", BUG_CHANNEL_ID="-100333", GROUP_FILTER="all", SCHED_PER_CHAT_GAP_S="0", SCHED_MIN_GAP_S="0")
 import pandas as pd, config as C, bot
 from datetime import timedelta
@@ -67,6 +67,7 @@ CLK[0] = pd.Timestamp("2026-01-09 07:30:30", tz="UTC"); b.session_start_check();
 import analyzer as A, numpy as np
 df = pd.DataFrame(dict(open=np.ones(80), high=np.ones(80)*1.001, low=np.ones(80)*0.999, close=np.ones(80)), index=pd.date_range("2026-01-09", periods=80, freq="1min", tz="UTC"))
 xx = A.compute(df); n = len(calls)
+b.bugs["*:B5m"]["fw"] = [12, 2]; b.bugs["*:B6_14"]["fw"] = [12, 2]
 b.bug_fire("*:B5m", list(C.PAIRS)[0], "CALL", "t", CLK[0], .9, x=xx); b.bug_last_pair.clear(); b.bug_last_pat.clear()
 b.bug_fire("*:B6_14", list(C.PAIRS)[1], "CALL", "t", CLK[0], .9, x=xx)
 hook = [c for c in calls[n:] if c[1].get("text") == "🐞 Bug hunting started"]; assert len(hook) == 1 and hook[0][1]["chat_id"] == "-100333"

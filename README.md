@@ -345,11 +345,11 @@ win rates on that data are ~50% by construction and say nothing about real edge.
   counts. The state also shows in `/status` and `/stats`. Counts reset at local midnight; a new session starts at the next start time.
 
 ## Dedicated 🐞 bug group (`BUG_CHANNEL_ID`, optional)
-- When `BUG_CHANNEL_ID` is set, every live bug signal (B1–B6, E/F bug-style, statistical and over-extension patterns) posts there.
-  That covers next-candle cards, `ENTER NOW` cards, the :57 CONFIRMED/SWITCH line and the result with its chart photo, all labelled `🐞 BUG SIGNAL`.
+- When `BUG_CHANNEL_ID` is set, **proven** bug signals (and warm-up signals) post there: next-candle cards, `ENTER NOW` cards, the :57 CONFIRMED/SWITCH line and the result with its chart photo, all labelled `🐞 BUG SIGNAL`.
   The posts carry no internal stats or reasoning; those stay in admin.
-- It is always on. There is no off switch. `/bugsignals` modes only change the extra routing (`admin` copy, public/VIP via `group`/`candidates`, `off` = no admin copy).
-  Only `/pause` stops it.
+- **Unproven** strategies/patterns (fewer than `BUG_LIVE_MIN_FW` / `P_LIVE_MIN` forward trades at ≥ breakeven) and history-filtered signals go to `SHADOW_CHANNEL_ID` as paper trades, not to the bug group.
+- There is no off switch for the bug group itself. `/bugsignals` modes only change the extra routing (`admin` copy, public/VIP via `group`/`candidates`, `off` = no admin copy).
+  Only `/pause` stops posting.
 - Bug signals still never reach PUBLIC/VIP unless the strategy is on the `/best` list and `GROUP_FILTER` allows it.
 - Cooldowns, the 77% floor and gap rejection apply. At 03:00 UTC+3 the bug group gets a short daily W/L per bug strategy.
 - `/status` shows `bug group ON (always)` or `not set`.
@@ -574,7 +574,7 @@ When this is set, the channel gets exactly what a public group gets, and nothing
 - the :57 line (✅ CONFIRMED, or 🔄 SWITCH only when the opposite body is ≥ 0.8 ATR);
 - the result, with a chart photo.
 
-This applies to shadow (relaxed) signals and to paper trades from unproven or admin-only bug, strategy and pattern signals. No tags, drop notes, summaries or test messages are sent there. Shadow and paper messages never go to the admin chat one by one. Their stats appear only in /stats and in the daily summary in the admin chat. Shadow results are scored in the original direction. Shadow and paper trades never count toward the daily stops or the cooldown. /status, the menu and the summary show a `📡 Routing` line. At startup the bot checks the channel silently with getChat and getChatMember, so nothing is posted. The admin is alerted only if the bot can't post there, and shadow routing is then off for that run. If the variable is unset, nothing changes.
+This applies to shadow (relaxed) signals and to paper trades from unproven or admin-only bug, strategy and pattern signals. No tags, drop notes, summaries or test messages are sent there. Shadow and paper messages never go to the admin chat one by one. Their stats appear only in /stats and in the daily summary in the admin chat. Shadow results are scored in the original direction. Shadow and paper trades never count toward the daily stops or the cooldown. /status, the menu and the summary show a `📡 Routing` line. At startup the bot posts an admin line with the resolved public/VIP/bug/shadow chat ids and titles (via getChat), and warns if any two share the same id. It then checks the shadow channel silently with getChatMember, so nothing is posted to the channels. The admin is alerted only if the bot can't post there, and shadow routing is then off for that run. If the variable is unset, nothing changes.
 
 ## Bug-group warm-up (`BUG_WARMUP=on`, `HIST_MIN_DAYS=7`)
 While a pair has fewer than `HIST_MIN_DAYS` of stored candles, the history gate would block every bug signal. In warm-up, a bug signal may still post to the **bug group only** when all of these hold:
@@ -600,3 +600,16 @@ The 77% floor is checked twice: when a signal is a candidate, and again at send 
 
 ## Telegram HTML safety
 Every HTML message (sendMessage, photo captions, inline-menu texts, scheduled posts) goes through `tghtml.sanitize`. Only the tags Telegram supports (b, i, u, s, code, pre, a, …) are kept. Every other `<`, `>` and `&` is escaped, for example in "payout 70% < 77%" or "< 0.3 ATR". If Telegram still answers 400 "can't parse entities", the message is retried once as plain text and the retry is logged. Per-signal bug messages to the admin chat (signal mirror, :57 detail, result) are now off by default and stored in the feedback log; `/verbose on` brings them back.
+
+## Win/loss streaks (admin only)
+`/stats` and the daily summary end with a 🔁 Streaks section, separate for **Main (public+VIP, one shared count)**, **Bug group** and **Shadow**
+(shadow uses the result shown in the shadow channel, including paper trades routed there). It shows the current streak (e.g. `W3`, `L2`),
+the longest win/loss streak for **today** (trading day from `TRADING_DAY_START`, 08:00 UTC+3), the last **7 days** and the last **30 days**,
+and loss clustering: 30-day `P(loss | previous loss)` vs the overall loss rate, each with its sample size.
+- Source: `STATE_DIR/streaks/results.jsonl`, one line per closed trade, ordered by close time; pruned to 31 days at day rollover; cleared by `/reset stats|all` (after backup).
+- **Ties/refunds (draws) neither extend nor break a streak** and are not counted in the rates.
+- Nothing is posted to groups or the shadow channel; no OTCharts requests; trading logic, cooldown and routing unchanged.
+- Starts empty: trades closed before this update are not back-filled.
+
+## Double-confirmation effect (silent paper-scoring)
+Every single-confirmation drop (bug, shadow, ensemble, pattern; not fill candidates) is paper-scored on the next candle from already-streamed candles (no extra API requests) and stored as `drop_single_confirmation_result` in the feedback log (pair, direction, entry time, which check failed: momentum/structure/both, payout, result). Never posted to any group or shadow channel. `/confirm2` shows passed vs dropped win rate with n and Wilson LB (today and 7d, split by failed check); `/filters` shows today's line.

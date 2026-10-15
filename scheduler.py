@@ -5,6 +5,7 @@ import json, logging, os, time, threading
 from datetime import timedelta
 import requests
 import config as C
+import tghtml
 log = logging.getLogger("sched")
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 EVENTS = ("on_public_session_start", "on_public_session_close", "on_daily_target", "on_bug_signal_first_of_day")
@@ -61,10 +62,10 @@ class Scheduler:
             if not cid: self.admin(f"⚠️ Scheduled #{it.get('id')} ({why}): {name.upper()}_CHANNEL_ID not set"); ok_all = False; continue
             t, p = it["type"], it["payload"]
             try:
-                if t == "text": calls = [("sendMessage", {"text": p, "parse_mode": "HTML", "disable_web_page_preview": True})]
+                if t == "text": calls = [("sendMessage", {"text": tghtml.sanitize(p), "parse_mode": "HTML", "disable_web_page_preview": True})]
                 elif t == "sticker": calls = [("sendSticker", {"sticker": p})]
                 elif t == "photo":
-                    fid, _, cap = p.partition("|"); calls = [("sendPhoto", dict(photo=fid, **({"caption": cap, "parse_mode": "HTML"} if cap else {})))]
+                    fid, _, cap = p.partition("|"); calls = [("sendPhoto", dict(photo=fid, **({"caption": tghtml.sanitize(cap), "parse_mode": "HTML"} if cap else {})))]
                 elif t in ("forward", "copy"):
                     fc, mid = p.rsplit(":", 1)
                     calls = [("forwardMessage" if t == "forward" else "copyMessage", {"from_chat_id": int(fc) if fc.lstrip("-").isdigit() else fc, "message_id": int(mid)})]

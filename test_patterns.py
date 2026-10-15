@@ -43,7 +43,7 @@ assert not GRP and bt.p_hist_day.get("P7") == 1 and not any("Filtered by history
 bt.hist_gate = lambda *a, **k: (True, "ok", "seen 40×")
 C.VERBOSE = True   # per-signal bug admin mirror is /verbose-only now
 bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); s = bt.bug_fire("*:P8", PR, "CALL", "t", T, .9, x=xx)
-assert not s["silent"] and not s["group"] and "admin only until proven" in ADM[-1] and not GRP
+assert not s["silent"] and not s.get("group") and "admin only until proven" in ADM[-1] and not GRP
 bt.bugs["*:P8"]["fw"] = [15, 6]; bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); s = bt.bug_fire("*:P8", list(C.PAIRS)[4], "CALL", "t", T, .9, x=xx)
 assert s["group"] and ("bug", "-1003") in s["chats"], "proven (21 fwd, 71% ≥ BE) → bug group"
 bt.bugs["*:P8"]["fw"] = [10, 11]; bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); assert not bt.bug_fire("*:P8", list(C.PAIRS)[1], "CALL", "t", T, .9, x=xx)["group"]

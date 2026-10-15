@@ -32,7 +32,7 @@ P = list(C.PAIRS)[0]
 # cards / results for public, vip, bug, shadow, paper
 b.tg.group(signal_caption(b.d.label(P), "PUT", T, 1, b.playbook("PUT"), 57, b.wait_line()), chats=[("public", "-1001"), ("vip", "-1002")])
 b.tg.group(result_caption("WIN", b.d.label(P), "PUT", 1.0, 0.99), chats=[("vip", "-1002")])
-sig = b.bug_fire("*:B6_14", P, "PUT", "t < 0.3 ATR & x", T, 0.9, x=xx)          # bug group
+b.bugs["*:B6_14"]["fw"] = [20, 5]; sig = b.bug_fire("*:B6_14", P, "PUT", "t < 0.3 ATR & x", T, 0.9, x=xx)          # proven → bug group
 b.d.now = lambda: sig["entry_at"] - timedelta(seconds=2); b.cached_candles = lambda p: df
 b.d.candles = lambda p, include_forming=False: (df.set_axis(pd.date_range(sig["entry_at"] - timedelta(minutes=200), periods=200, freq="1min", tz="UTC")), 0, True)
 b.bug_precheck_due()

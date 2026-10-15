@@ -8,15 +8,23 @@ def _env(*names, default=None):
             return v
     return default
 
+def _env_chat(*names, default=None):
+    """Channel/chat id from env: strip whitespace/quotes; keep as string (Telegram accepts '-100…' strings; do not int())."""
+    v = _env(*names, default=default)
+    if v is None: return default
+    v = str(v).strip().strip('"').strip("'")
+    return v if v else default
+
 # ---- secrets / ids (primary name first, then fallbacks) ----
 OTCHARTS_API_KEY    = _env("OTCHARTS_API_KEY", "OTCHARTS_KEY", "OTC_API_KEY")
 TELEGRAM_BOT_TOKEN  = _env("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN")
-TELEGRAM_CHANNEL_ID = _env("TELEGRAM_CHANNEL_ID", "CHANNEL_ID", "CHAT_ID", "TELEGRAM_CHAT_ID")
-TELEGRAM_ADMIN_ID   = _env("TELEGRAM_ADMIN_ID", "ADMIN_CHAT_ID", "ADMIN_ID")
+TELEGRAM_CHANNEL_ID = _env_chat("TELEGRAM_CHANNEL_ID", "CHANNEL_ID", "CHAT_ID", "TELEGRAM_CHAT_ID")
+TELEGRAM_ADMIN_ID   = _env_chat("TELEGRAM_ADMIN_ID", "ADMIN_CHAT_ID", "ADMIN_ID")
 # Public / VIP channel switch (optional). VIP falls back to TELEGRAM_CHANNEL_ID (today: DUNYABAZAAR VIP).
-PUBLIC_CHANNEL_ID   = _env("PUBLIC_CHANNEL_ID")
-VIP_CHANNEL_ID      = _env("VIP_CHANNEL_ID", "TELEGRAM_CHANNEL_ID", "CHANNEL_ID", "CHAT_ID", "TELEGRAM_CHAT_ID")
-def channel_ids(): return {"public": PUBLIC_CHANNEL_ID, "vip": VIP_CHANNEL_ID}
+PUBLIC_CHANNEL_ID   = _env_chat("PUBLIC_CHANNEL_ID")
+VIP_CHANNEL_ID      = _env_chat("VIP_CHANNEL_ID", "TELEGRAM_CHANNEL_ID", "CHANNEL_ID", "CHAT_ID", "TELEGRAM_CHAT_ID")
+def channel_ids():
+    return {"public": PUBLIC_CHANNEL_ID, "vip": VIP_CHANNEL_ID, "bug": BUG_CHANNEL_ID, "shadow": SHADOW_CHANNEL_ID}
 
 # ---- runtime mode ----
 DATA_SOURCE     = _env("DATA_SOURCE", default="otcharts")   # otcharts | replay | mockstream (tests)
@@ -208,7 +216,7 @@ BUG_MAX_ALERTS_PER_HOUR = 3
 BUG_BIG_ATR = 1.2
 BUG_SAME_BODY_FRAC = 0.05
 # bug SIGNALS (live): admin (default) | group | candidates | off  (runtime: /bugsignals)
-BUG_CHANNEL_ID = _env("BUG_CHANNEL_ID")                         # optional dedicated 🐞 bug group
+BUG_CHANNEL_ID = _env_chat("BUG_CHANNEL_ID")                     # optional dedicated 🐞 bug group
 BUG_SIGNALS = _env("BUG_SIGNALS", default="admin").lower()   # admin | group | candidates | off — extra routing only; the bug group (if set) always gets bug signals
 BUG_SIGNALS_FILE = os.path.join(STATE_DIR, "bug_signals.json")
 BUG_SIGNAL_COOLDOWN_MIN = 5    # per pattern/strategy
@@ -346,7 +354,7 @@ VOLUME_MAX_HOUR = int(_env("VOLUME_MAX_HOUR", default="6"))           # cap for 
 VOLUME_SLOT_MIN = int(_env("VOLUME_SLOT_MIN", default="10"))          # pace ≈ 1 per 10 min
 VOLUME_GUARD_N = int(_env("VOLUME_GUARD_N", default="40"))            # alert if Tier 3 < breakeven after this many live trades
 VERBOSE = _env("VERBOSE", default="off").lower() == "on"           # per-drop admin notes (single-confirmation / filtered by history)
-SHADOW_CHANNEL_ID = _env("SHADOW_CHANNEL_ID", default="")           # shadow + paper (admin-only/unproven) signals go here; unset = admin chat
+SHADOW_CHANNEL_ID = _env_chat("SHADOW_CHANNEL_ID", default="")      # shadow + paper (admin-only/unproven) signals go here; unset = admin chat
 FEEDBACK_KEEP_DAYS = int(_env("FEEDBACK_KEEP_DAYS", default="30"))   # STATE_DIR/feedback/*.jsonl rotation
 PAYOUT_MAX_AGE_SEC = int(_env("PAYOUT_MAX_AGE_SEC", default="600"))   # payout older than this = unknown = BLOCKED (fail closed)
 PAYOUT_REFRESH_PAUSED_SEC = int(_env("PAYOUT_REFRESH_PAUSED_SEC", default="540"))   # payout refresh cadence even when REST candles are paused for budget (~160 req/day)

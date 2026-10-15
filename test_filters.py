@@ -50,7 +50,7 @@ xx = A.compute(pd.DataFrame(dict(open=np.ones(80), high=np.ones(80) * 1.001, low
 for _ in range(3): b.streak_result("live", "LOSS")
 assert any("3 losses in a row, paused until" in m for m in ADM) and not GRP
 assert b.live_block(T) and not b.fill_due(T.replace(minute=25))
-b.bugsignals_cmd(["group"]); b.bugs["*:B6_14"]["fw"] = [0, 0]
+b.bugsignals_cmd(["group"]); b.bugs["*:B6_14"]["fw"] = [12, 3]   # proven: bug group still posts during live freeze
 s = b.bug_fire("*:B6_14", P, "PUT", "t", T, .9, x=xx); assert s and [c for c in s.get("chats", [])] == [("bug", "-1003")], s.get("chats")
 # bug group's own streak
 for _ in range(3): b.streak_result("bug", "LOSS")

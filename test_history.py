@@ -44,10 +44,11 @@ C.VERBOSE = True; s = b.bug_fire("*:B6_14", P, "PUT", "t", T, .9, x=xx); C.VERBO
 assert not GRP and b.hist_day["filtered"] == 1 and s in b.bug_sigs
 # tick strategy: no replayable history → filtered
 b.bug_last_pair.clear(); b.bug_last_pat.clear(); C.VERBOSE = True; s = b.bug_fire("*:B1", list(C.PAIRS)[1], "PUT", "t", T, .9, kind="now", entry_price=1.0, x=xx); C.VERBOSE = False
-assert s["silent"] and "no replayable" in ADM[-1]
+assert s["silent"] and any("no replayable" in m or "Filtered by history" in m for m in ADM[-5:]), ADM[-5:]
 # gate passes (stub) → card shows the history line
 b.hist.check = lambda p, nd, comp, now, pay: (True, "ok", "seen 23× in 30d, 17 won (74%)")
 C.VERBOSE = True   # per-signal bug admin mirror is /verbose-only now
+b.bugs["*:B6_14"]["fw"] = [20, 5]   # proven so it can reach bug/public once history passes
 b.bug_last_pair.clear(); b.bug_last_pat.clear(); s = b.bug_fire("*:B6_14", list(C.PAIRS)[2], "PUT", "t", T, .9, x=xx)
 assert not s["silent"] and GRP and not any("seen" in t or "history" in t for t in GRP), GRP[-1:]
 assert any("📚 seen 23× in 30d, 17 won (74%)" in m for m in ADM), "history only in admin"

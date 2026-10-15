@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd, requests
 import config as C
 import feedback as FB
+import streakstats as SS
 import tghtml
 from analyzer import bug_B1, bug_B2, bug_B3, demarker, rsi as _rsi
 from analyzer import (ensemble, analyze_relaxed_ensemble, apply_level, strategies_line, bug_scan, bug_prediction,
@@ -350,7 +351,7 @@ class Bot:
         self.shadow_next = {}           # pair -> datetime (per-pair shadow cooldown)
         self.load_stats(); self.load_shadow(); self.load_channel(); self.load_bench()
         self.tel = Telemetry(); self._attach_tel(); self.hist = HistGate(); self.hist_day = {'filtered': 0, 'passed': 0}; self.load_hist_mode(); self.tier_sent = []; self.tier_day = {}; self.load_tiers()
-        self.dc_day = {}; self._dc_note = {}; self.fill_pool = []; self.fill_pair_last = {}; self.p_hist_day = {}; self.streaks = Streaks(); self.news = News(); self.blocked_min = []; self._blk = None; self._news_seen = set(); self.load_filters()
+        self.dc_day = {}; self._dc_note = {}; self.dc_paper = []; self.fill_pool = []; self.fill_pair_last = {}; self.p_hist_day = {}; self.streaks = Streaks(); self.news = News(); self.blocked_min = []; self._blk = None; self._news_seen = set(); self.load_filters()
         self.load_day()   # after all per-day counters exist
         self.sched = Scheduler(lambda t: self.tg.admin(t), lambda: self.d.now()); self.tg.raw_hook = self.sched_hook; self.tg.cb_hook = self.on_callback; self._bug_first = None
         self.load_level(); self.load_strat(); self.load_bugs(); self.load_lb()
@@ -440,6 +441,8 @@ class Bot:
             _an.STRAT_WEIGHTS.clear(); _an.STRAT_MUTED.clear(); self.lb_live = False
             self.tier_total = {"1": [0, 0], "2": [0, 0]}; self.save_tiers()
             self.save_stats(); self.save_strat(); self.save_shadow(); done.append("all W/L, trade counts, strategies, leaderboard")
+            try: os.remove(SS.path()); done.append("streak ledger")
+            except OSError: pass
         if scope in ("bugs", "all"):
             self.bug_sigs = []; self.load_bugs(); done.append(f"bug watcher ({len(self.bugs)} built-in strategies re-created at 0W/0L)")
         if scope in ("telemetry", "all"): self.tel = Telemetry(); self._attach_tel(); done.append("telemetry")
@@ -805,7 +808,8 @@ class Bot:
                                                     f"shadow_{t['pair']}_{t['entry_at']:%Y%m%d_%H%M}.png", chats=sh)
                     except Exception as e: log.warning("shadow chart: %s", e)
                 if not sent: self.tg.group(cap, chats=sh)
-            else: self.tg.admin(txt)
+                SS.record("shadow", rr, now, t["pair"])   # streak = what the shadow channel showed (traded direction)
+            else: self.tg.admin(txt); SS.record("shadow", res, now, t["pair"])
             self.log_shadow(t, o, c, res)
             try: self.save_shadow()
             except Exception as e: log.warning("shadow save: %s", e)
@@ -1171,7 +1175,7 @@ class Bot:
                       + f"\nNow: pause {on(self.manual_pause)} · news {on(C.NEWS_FILTER)} · blackout {on(C.BLACKOUT_ON)} · cooldown {C.LOSS_STREAK_N}L/{C.STREAK_COOLDOWN_MIN}m"
                       f" · daily stop −{C.DAILY_STOP_NET or 'off'}/+{C.DAILY_PROFIT_CLOSE or 'off'} · payout ≥{C.MIN_PAYOUT:.0%} · history {C.HIST_GATE} (P: always) · DC {on(C.DOUBLE_CONFIRM)}"
                       f" · level {self.level} · fill {on(C.FILL_MIN_HOUR)} · :57 switch ≥{C.SWITCH_MIN_BODY_ATR} ATR"
-                      + (f"\nBlocking now: {self.live_block(now)}" if self.live_block(now) else ""))
+                      + (f"\nBlocking now: {self.live_block(now)}" if self.live_block(now) else "") + "\n" + self.dc_stats_line(1))
     def pair_news(self, pair, now):
         e = self.news.blocking(pair, now)
         return f"news blackout: {e['cur']} {e['title']} at {C.hm(datetime.fromisoformat(e['t']))} {C.TZ_LABEL}" if e else None
@@ -1241,6 +1245,7 @@ class Bot:
         self.dc_day["dropped"] = self.dc_day.get("dropped", 0) + 1
         last = self._dc_note.get(pair); nowt = time.time()
         self.drop_note("dc", src, f"➖ single-confirmation, dropped: {src} {pair} {side} · {txt}")
+        self.dc_paper_add(src, pair, side, "both" if not (m or st_) else ("momentum" if not m else "structure"))
         return False
     def patterns_cmd(self, args):
         if args and args[0] in ("on", "off"): C.PATTERNS_ON = args[0] == "on"; self.save_filters()
@@ -1342,10 +1347,55 @@ class Bot:
     def verbose_cmd(self, args):
         if args and args[0] in ("on", "off"): C.VERBOSE = args[0] == "on"; self.save_filters()
         self.tg.admin(f"🔈 Verbose drop notes: {'ON (every single-confirmation / filtered-by-history drop is posted here)' if C.VERBOSE else 'OFF (counted only; see /stats, /patterns, daily summary)'}")
+    def dc_paper_add(self, src, pair, side, failed, payout=None):
+        """Silent paper-scoring of a single-confirmation drop (never posted anywhere). Scored from already-streamed candles; no extra API requests."""
+        try:
+            if payout is None:
+                try: payout = self.d.payout_info(pair)[0]
+                except Exception: payout = None
+            entry = self.d.now().replace(second=0, microsecond=0) + timedelta(minutes=1)
+            key = (src, pair, side, entry)
+            if any(g["key"] == key for g in self.dc_paper): return
+            self.dc_paper.append({"key": key, "src": src, "pair": pair, "dir": side, "failed": failed, "payout": payout, "entry_at": entry})
+            if len(self.dc_paper) > 500: self.dc_paper = self.dc_paper[-500:]
+        except Exception as e: log.warning("dc paper add: %s", e)
+    def dc_paper_resolve(self):
+        if not self.dc_paper: return
+        now = self.d.now(); keep = []
+        for g in self.dc_paper:
+            settle = g["entry_at"] + timedelta(minutes=1)
+            if now < settle + timedelta(seconds=1): keep.append(g); continue
+            df = self.cached_candles(g["pair"]); bar = df.loc[df.index == g["entry_at"]] if df is not None else None
+            if bar is None or bar.empty:
+                if now - settle < timedelta(minutes=C.SHADOW_MAX_WAIT_MIN): keep.append(g)
+                continue
+            o, c = float(bar.open.iloc[0]), float(bar.close.iloc[0])
+            res = "TIE" if c == o else ("WIN" if (c > o) == (g["dir"] == "CALL") else "LOSS")
+            self.fb("drop_single_confirmation_result", f"{res} ({o:.5f}→{c:.5f}) · failed {g['failed']}", source=g["src"], pair=g["pair"], dir=g["dir"],
+                    result=res, failed=g["failed"], payout=g["payout"], entry=g["entry_at"].isoformat(), open=o, close=c, silent=True, paper=True)
+        self.dc_paper = keep
+    def dc_stats_line(self, days=1):
+        """Passed (scored bug/shadow results) vs dropped (paper-scored single-confirmation drops), from the feedback log."""
+        from history import wilson_lb as _lb
+        try: recs = FB.read(days, self.d.now())
+        except Exception: recs = []
+        def agg(rs):
+            w = sum(1 for r in rs if r.get("result") == "WIN"); l = sum(1 for r in rs if r.get("result") == "LOSS"); n = w + l
+            pays = [float(r["payout"]) for r in rs if r.get("payout") not in (None, "")]
+            return w, n, (sum(pays) / len(pays) if pays else None)
+        def fmt(lab, rs):
+            w, n, _ = agg(rs)
+            return f"{lab} {w}/{n} = {w/n:.0%} (LB {_lb(w, n):.0%})" if n else f"{lab} n=0"
+        passed = [r for r in recs if r.get("kind") in ("bug_result", "shadow_result")]
+        drops = [r for r in recs if r.get("kind") == "drop_single_confirmation_result"]
+        _, _, ap = agg(drops)
+        be = f" · BE {1/(1+ap):.1%} @ {ap:.0%}" if ap else ""
+        return (f"🔗 DC effect {days}d: " + fmt("passed", passed) + " · " + fmt("dropped", drops)
+                + " (" + ", ".join(fmt("no " + f, [r for r in drops if r.get("failed") == f]) for f in ("momentum", "structure", "both")) + ")" + be)
     def dc_cmd(self, args):
         if args and args[0] in ("on", "off"): C.DOUBLE_CONFIRM = args[0] == "on"; self.save_filters()
         self.tg.admin(f"🔗 Double confirmation {'ON' if C.DOUBLE_CONFIRM else 'OFF'}: momentum trigger AND structure (BB / swing S/R / ZigZag pivot / rejection wick) "
-                      f"· today {self.dc_day.get('dropped', 0)} dropped of {self.dc_day.get('checked', 0)} checked")
+                      f"· today {self.dc_day.get('dropped', 0)} dropped of {self.dc_day.get('checked', 0)} checked\n" + self.dc_stats_line(1) + "\n" + self.dc_stats_line(7))
     def hour_sent(self, now):
         h = now.replace(minute=0, second=0, microsecond=0)
         return sum(1 for t in self.tier_sent if pd.Timestamp(t) >= h)
@@ -1541,7 +1591,7 @@ class Bot:
             return self.bug_mode in ("group", "candidates") and k in self.best_live()
         return self.bug_mode == "group" or (self.bug_mode == "candidates" and b.get("status") == "candidate")
     def bug_fire(self, k, pair, d, desc, now, payout, kind="next", entry_price=None, x=None):
-        """Fire (or silently paper-track) a bug signal. 77% floor; never on a pair with a pending group trade; cooldowns."""
+        """Fire a bug signal. Bug group = proven or warm-up only; unproven / history-filtered → SHADOW_CHANNEL_ID (paper). Hard-silent = demoted/cooldown/pause."""
         b = self.bugs.get(k)
         if b is None or payout is None or payout < C.MIN_PAYOUT: return None
         isP = b.get("key", "").startswith("P")
@@ -1550,6 +1600,7 @@ class Bot:
             if not pok:
                 self.dc_day["dropped"] = self.dc_day.get("dropped", 0) + 1
                 self.drop_note("dc", f"pattern {b['key']}", f"➖ single-confirmation, dropped: pattern {b['key']} {pair} {d} · {ptxt}")
+                self.dc_paper_add(f"pattern {b['key']}", pair, d, "structure" if "gives momentum" in ptxt else ("momentum" if "gives structure" in ptxt else "unknown"), payout)
                 return None
         elif x is not None and not self.dc_ok(f"bug {k.split(':')[-1]}", pair, d, x): return None
         if self.pending and self.pending.get("pair") == pair: return None
@@ -1557,15 +1608,14 @@ class Bot:
         if any(o["k"] == k and o["pair"] == pair and o["entry_at"] == entry for o in self.bug_sigs): return None
         cool = (self.bug_last_pair.get(pair) and now - self.bug_last_pair[pair] < timedelta(minutes=C.BUG_PAIR_COOLDOWN_MIN)) or \
                (self.bug_last_pat.get(k) and now - self.bug_last_pat[k] < timedelta(minutes=C.BUG_SIGNAL_COOLDOWN_MIN))
-        fw_n = sum(b["fw"]); unproven = not b.get("strategy") and (fw_n < C.BUG_LIVE_MIN_FW or b["fw"][0] / fw_n < breakeven(payout))
-        silent = b.get("status") == "demoted" or bool(cool) or self.manual_pause or unproven or \
-                 (self.bug_mode == "off" and not C.BUG_CHANNEL_ID)
+        hard = b.get("status") == "demoted" or bool(cool) or self.manual_pause   # never post anywhere
         atr = float(x.atr.iloc[-1]) if x is not None and len(x) else None
         exp = PAT.EXPIRY.get(b.get("key"), C.EXPIRY_MIN) if isP else C.EXPIRY_MIN
         sig = {"k": k, "pair": pair, "dir": d, "traded": d, "entry_at": entry, "settle_at": entry + timedelta(minutes=exp), "expiry": exp,
-               "kind": kind, "entry_price": entry_price, "payout": payout, "silent": silent, "group": False, "atr": atr,
+               "kind": kind, "entry_price": entry_price, "payout": payout, "silent": hard, "group": False, "atr": atr,
                "prechecked": kind == "now", "desc": desc}
-        if not silent and (C.HIST_GATE != "off" or isP):   # P patterns: history check is mandatory (no bypass)
+        hist_block = False
+        if not hard and (C.HIST_GATE != "off" or isP):   # P patterns: history check is mandatory (no bypass)
             if b.get("strategy"): hok, hwhy, hline = self.hist_gate(pair, [b["key"]], now, payout, "bugs", force=isP)
             else:   # statistical patterns ARE history: use their scanned sample (30d window) with the same thresholds
                 nn = int(b.get("n", 0)); hs = {"n30": nn, "w30": int(round(b.get("rate", 0) * nn)), "n7": 0, "w7": 0}
@@ -1574,42 +1624,60 @@ class Bot:
                 hok = True; sig["warmup"] = True
             self.hist_count(hok); sig["hist_line"] = hline
             if not hok:
-                silent = sig["silent"] = True
+                hist_block = True
                 if isP: self.p_hist_day[b["key"]] = self.p_hist_day.get(b["key"], 0) + 1
                 self.drop_note("hist", f"{'pattern' if isP else 'bug'} {b['key']}", f"📚 Filtered by history: 🐞 {pair} {d} {b['key']} · {hwhy}" + (f" · {hline}" if hline else "") + " · paper-tracked")
         self.bug_sigs.append(sig)
-        if silent: return sig
-        self.bug_last_pair[pair] = now; self.bug_last_pat[k] = now
-        w, l = b["fw"]; strat = b.get("strategy")
-        p_unproven = isP and (w + l < C.P_LIVE_MIN or w / (w + l) < breakeven(payout))   # admin-only until proven
+        if hard: return sig
+        w, l = b["fw"]; nfw = w + l; be = breakeven(payout); strat = b.get("strategy")
+        need = C.P_LIVE_MIN if isP else C.BUG_LIVE_MIN_FW
+        unproven = nfw < need or (nfw > 0 and w / nfw < be)   # strategies AND patterns: bug group only after live proof (or warm-up)
         what = f"{b['key']} {b['desc']} — {desc}" if strat else desc
         when = f"ENTER NOW {C.hm(entry)}:{entry.second:02d}" if kind == "now" else f"entry {C.hm(entry)}"
         alert = (f"🐞 BUG SIGNAL {pair} {d} — {when} {C.TZ_LABEL} · {sig['expiry']} min · pattern: {what} (fwd {w}W/{l}L)"
-                      f" · payout {payout:.0%} · {self.tel.lag_tag(pair)}" + (f" · 📚 {sig['hist_line']}" if sig.get("hist_line") else "") + (" · admin only until proven (≥%d fwd ≥ BE)" % C.P_LIVE_MIN if p_unproven else (" · → GROUP" if self.bug_route_group(b, k) else "")) + " · experimental, patterns can be false")
+                      f" · payout {payout:.0%} · {self.tel.lag_tag(pair)}" + (f" · 📚 {sig['hist_line']}" if sig.get("hist_line") else "")
+                      + ((" · unproven → shadow/paper" if C.SHADOW_CHANNEL_ID else " · admin only until proven (≥%d fwd ≥ BE)" % need)
+                         if unproven and not sig.get("warmup") else (" · → GROUP" if self.bug_route_group(b, k) else ""))
+                      + " · experimental, patterns can be false")
         blk = session_blackout(now) or self.pair_news(pair, now)
-        if p_unproven: blk = blk or "pattern unproven (admin only)"
         pok, pnow, pwhy = self.payout_gate(pair)
         if not pok: blk = blk or f"{pwhy} at send time"
         sig["payout_send"] = pnow
         if sig.get("warmup"): alert += " · 🌱 warm-up (history < %g days; bug group only)" % C.HIST_MIN_COVER_DAYS
-        main = self.cap_chats(list(self.tg.chats or self.chats_for(self.target))) if not sig.get("warmup") and self.bug_route_group(b, k) and not blk and not self.streaks.frozen("live", now) and not self.dstop_block("live", now) else []
-        bugch = [("bug", C.BUG_CHANNEL_ID)] if C.BUG_CHANNEL_ID and not blk and not self.streaks.frozen("bug", now) and not self.dstop_block("bug", now) else []   # bug group: always on (only temporary cooldown/blackout)
+        # Bug group: proven live record OR warm-up. Unproven / history-filtered → shadow paper (never bug).
+        can_bug = bool(C.BUG_CHANNEL_ID) and not blk and not hist_block and (not unproven or sig.get("warmup")) \
+                  and not self.streaks.frozen("bug", now) and not self.dstop_block("bug", now)
+        can_main = (not sig.get("warmup") and not unproven and not hist_block and self.bug_route_group(b, k)
+                    and not blk and not self.streaks.frozen("live", now) and not self.dstop_block("live", now))
+        main = self.cap_chats(list(self.tg.chats or self.chats_for(self.target))) if can_main else []
+        bugch = [("bug", C.BUG_CHANNEL_ID)] if can_bug else []
         if sig.get("warmup") and bugch: self.warmup_sent.append(now)
         paper = [("shadow", C.SHADOW_CHANNEL_ID)] if C.SHADOW_CHANNEL_ID and not (main or bugch) else []
+        self.bug_last_pair[pair] = now; self.bug_last_pat[k] = now   # cooldown even when only admin/paper-tracked
+        if not (main or bugch or paper):
+            # Nowhere to post (no SHADOW / BUG / public). Keep silent=False so /verbose admin mirror and forward tracking still work.
+            sig["silent"] = bool(hist_block)   # history-filtered with no shadow → silent paper-track; otherwise admin-visible candidate
+            if self.bug_mode != "off" and C.VERBOSE: self.tg.admin(alert)
+            self.fb("paper_signal", alert, source=k, pair=pair, dir=d,
+                    blocked=blk or ("filtered by history" if hist_block else "") or ("unproven" if unproven and not sig.get("warmup") else ""),
+                    payout_candidate=payout, payout_send=pnow, payout_check=pwhy, routed=[])
+            return sig
         if self.bug_mode != "off" and not paper and C.VERBOSE: self.tg.admin(alert)   # per-signal bug mirror: feedback log (admin only with /verbose on)
-        self.fb("warmup_signal" if sig.get("warmup") else ("paper_signal" if not (main or bugch) else "bug_signal"), alert, source=k, pair=pair, dir=d,
-                blocked=blk or "", payout_candidate=payout, payout_send=pnow, payout_check=pwhy, routed=[c[0] for c in main + bugch + paper])
-        if main or bugch or paper:
-            sig["group"] = True; sig["chats"] = main + bugch + paper; sig["paper"] = bool(paper); lab = self.d.label(pair)
-            self.pubcap_posted(main)
-            if bugch and self._bug_first != self.day_date: self._bug_first = self.day_date; self.sched.fire("on_bug_signal_first_of_day")
-            if kind == "now":
-                self.tg.group(f"🐞 BUG SIGNAL · {display_name(lab)} {'🟢 CALL ⬆️' if d == 'CALL' else '🔴 PUT ⬇️'}\n⚡ ENTER NOW {C.hm(entry)}:{entry.second:02d} {C.TZ_LABEL} · ⌛ {sig['expiry']} min", chats=sig["chats"])
-            else:
-                p1, p2 = self.playbook(d)
-                cap = "🐞 BUG SIGNAL\n" + signal_caption(lab, d, entry, sig['expiry'], (p1, p2) if C.PRECHECK_MODE in ("confirm", "direction") else None,
-                                                  C.PRECHECK_SECOND, self.wait_line())
-                self.tg.group(cap, chats=sig["chats"])
+        self.fb("warmup_signal" if sig.get("warmup") else ("paper_signal" if paper else "bug_signal"), alert, source=k, pair=pair, dir=d,
+                blocked=blk or ("filtered by history" if hist_block else "") or ("unproven" if unproven and not sig.get("warmup") else ""),
+                payout_candidate=payout, payout_send=pnow, payout_check=pwhy, routed=[c[0] for c in main + bugch + paper])
+        sig["silent"] = False; sig["group"] = True; sig["chats"] = main + bugch + paper; sig["paper"] = bool(paper); lab = self.d.label(pair)
+        if paper and C.BUG_CHANNEL_ID and C.SHADOW_CHANNEL_ID and str(C.SHADOW_CHANNEL_ID) == str(C.BUG_CHANNEL_ID):
+            log.warning("SHADOW_CHANNEL_ID equals BUG_CHANNEL_ID (%s); paper posts will land in the bug chat — fix Railway vars", C.BUG_CHANNEL_ID)
+        self.pubcap_posted(main)
+        if bugch and self._bug_first != self.day_date: self._bug_first = self.day_date; self.sched.fire("on_bug_signal_first_of_day")
+        if kind == "now":
+            self.tg.group(f"🐞 BUG SIGNAL · {display_name(lab)} {'🟢 CALL ⬆️' if d == 'CALL' else '🔴 PUT ⬇️'}\n⚡ ENTER NOW {C.hm(entry)}:{entry.second:02d} {C.TZ_LABEL} · ⌛ {sig['expiry']} min", chats=sig["chats"])
+        else:
+            p1, p2 = self.playbook(d)
+            cap = "🐞 BUG SIGNAL\n" + signal_caption(lab, d, entry, sig['expiry'], (p1, p2) if C.PRECHECK_MODE in ("confirm", "direction") else None,
+                                              C.PRECHECK_SECOND, self.wait_line())
+            self.tg.group(cap, chats=sig["chats"])
         return sig
     def bug_precheck_due(self):
         try: self.shadow_precheck_due()
@@ -1679,7 +1747,7 @@ class Bot:
                         except Exception as e: log.warning("bug chart: %s", e)
                     if not sent: self.tg.group(cap, chats=g["chats"])
                     self.pubcap_result(g["chats"], res)
-                    if any(ch[0] == "bug" for ch in g["chats"]): self.bug_day.setdefault(b["key"], [0, 0])[0 if res == "WIN" else 1] += 1; self.streak_result("bug", res); self.dstop_result(res, "bug")
+                    if any(ch[0] == "bug" for ch in g["chats"]): self.bug_day.setdefault(b["key"], [0, 0])[0 if res == "WIN" else 1] += 1; self.streak_result("bug", res); self.dstop_result(res, "bug"); SS.record("bug", res, self.d.now(), g["pair"])
                     if any(ch[0] in ("public", "vip") for ch in g["chats"]): self.streak_result("live", res); self.dstop_result(res)
             w, l = b["fw"]; be = breakeven(g["payout"])
             if w + l >= C.BUG_DEMOTE_MIN_FW and w/(w + l) < be and b.get("status") != "demoted":
@@ -2054,6 +2122,8 @@ class Bot:
             if C.SHADOW_RELAXED:
                 try: self.shadow_resolve()
                 except Exception: log.exception("shadow resolve failed")
+            try: self.dc_paper_resolve()
+            except Exception as e: log.warning("dc paper resolve: %s", e)
             if C.BUG_WATCH:
                 try: self.bug_resolve()
                 except Exception: log.exception("bug resolve failed")
@@ -2319,7 +2389,7 @@ class Bot:
                     except Exception as e: log.warning("chart render failed (%s); sending text", e)
                 if not sent: self.tg.group(cap, chats=t.get("chats"))
             self.pubcap_result(t.get("chats"), res)
-            if any(c_[0] in ("public", "vip", "group") for c_ in (t.get("chats") or [])): self.streak_result("live", res); self.dstop_result(res)
+            if any(c_[0] in ("public", "vip", "group") for c_ in (t.get("chats") or [])): self.streak_result("live", res); self.dstop_result(res); SS.record("main", res, self.d.now(), t["pair"])
             if not tie:
                 self.day.setdefault(t["pair"], [0, 0, 0])[0 if win else 1] += 1
                 k = "switched" if t.get("kind", "").startswith("switched") else "confirmed"
@@ -2403,7 +2473,38 @@ class Bot:
         if C.SHADOW_RELAXED:
             lines += ["  👻 Shadow (relaxed) — not posted:"] + ["  " + l for l in self.shadow_lines(True)]
         lines.append("  " + self.routing_line())
+        try: lines.append(SS.text(self.d.now()))
+        except Exception as e: log.warning("streak stats: %s", e)
         return "\n".join(lines)
+    def _chat_title(self, cid):
+        """Best-effort title via getChat (nothing is posted)."""
+        if not cid: return "not set"
+        if not self.tg.on: return "(telegram disabled)"
+        try:
+            r = __import__("requests").get(f"{self.tg.base}/getChat", params={"chat_id": cid}, timeout=10).json()
+            if not r.get("ok"): return f"ERROR: {r.get('description', 'chat not found')}"
+            res = r["result"]
+            return res.get("title") or res.get("username") or res.get("type") or "?"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    def channel_routing_report(self):
+        """Startup admin line: resolved public/VIP/bug/shadow ids + titles; warn if any two share an id."""
+        rows = [("public", C.PUBLIC_CHANNEL_ID), ("vip", C.VIP_CHANNEL_ID), ("bug", C.BUG_CHANNEL_ID), ("shadow", C.SHADOW_CHANNEL_ID)]
+        lines = ["📡 Channel IDs (resolved):"]
+        by_id = {}
+        for name, cid in rows:
+            if not cid:
+                lines.append(f"  {name}: not set"); continue
+            title = self._chat_title(cid)
+            lines.append(f"  {name}: {cid} · {title}")
+            by_id.setdefault(str(cid), []).append(name)
+        dups = [(cid, names) for cid, names in by_id.items() if len(names) > 1]
+        for cid, names in dups:
+            lines.append(f"⚠️ SAME chat id for {' + '.join(names)} ({cid}) — those signals will mix in one chat. Each channel needs its own -100… id.")
+        self.tg.admin("\n".join(lines))
+        return dups
+
     def shadow_channel_check(self):
         if not C.SHADOW_CHANNEL_ID: return
         ok, why = self.tg.check_post(C.SHADOW_CHANNEL_ID)
@@ -2437,6 +2538,8 @@ class Bot:
         try: self.week_record()
         except Exception as e: log.warning("week record: %s", e)
         self.shadow_day = {}; self.strat_day = {}; self.save_strat()
+        try: SS.prune(self.d.now())
+        except Exception as e: log.warning("streak prune: %s", e)
         self.day = {p: [0, 0, 0] for p in self.all_pairs}; self.day_date = today
         if today.weekday() == 6:   # 00:00 UTC Sunday = 03:00 UTC+3 Sunday review
             try: self.weekly_report()
@@ -2489,7 +2592,7 @@ def main():
     if bot.tg.on:
         threading.Thread(target=bot.tg.poll_commands, args=(bot.command,), daemon=True).start()
         bot.tg.admin("🤖 Bot started")
-        bot.persistence_check(); bot.shadow_channel_check()
+        bot.persistence_check(); bot.channel_routing_report(); bot.shadow_channel_check()
     if hasattr(data, "res"):
         bot.tg.admin("🔎 Symbol resolution:\n" + "\n".join(describe(r) for r in data.res.values()))
     n = 0
