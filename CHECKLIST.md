@@ -28,6 +28,7 @@
 | Filter precedence (/filters) | test_extras | PASS |
 | Weekly report and self-tune (Sunday 03:00; hard blocks never loosened) | test_extras | PASS |
 | Volume mode / Tier 3 (10-min pace, cap 6/h, 1 per pair per 10 min, UB ≥ BE only, hard blocks, admin-only tier tag, safeguard alert at 40 trades, /volume + menu + persistence, /stats /best weekly) | test_volume | PASS |
+| Quiet drop counters + /verbose; summary header shows budget day (03:00) and trading day (08:00) separately | test_filters, test_patterns, test_history | PASS |
 | All commands and menu buttons | test_all_commands, test_menu, test_tz_commands | PASS |
 | Stream, recovery, modes, bench, auto level | remaining tests | PASS |
 | Replay / mockstream end-to-end | runall | rc=0 |
@@ -37,3 +38,7 @@
 - Volume-mode simulation: `volume_results.txt` (`volume_sim.py`).
 - Pattern backtests: `pattern_backtest_fx.txt` and `pattern_backtest_synthetic.txt`.
 - `frequency_results.txt` holds the first fill-tuning grid. It was produced before the final pacing tweak (slot wait 6→3 and the blocked-minute cap). `ablation_results.txt` reflects the final logic.
+| test_shadow_channel.py | shadow routing, :57 line, summary section, routing line, startup check, unset fallback |
+| test_warmup.py | bug-group warm-up thresholds, 4/h cap, bug-group-only, admin tag, /history days |
+| test_feedback.py | feedback jsonl store, rotation, /feedback, export CSV+JSON, menu, /reset feedback + backup |
+| test_payout_floor.py | NZDUSD 58%/unknown/stale → blocked at candidate + send time, no default payout, refresh while paused, payout in feedback log |

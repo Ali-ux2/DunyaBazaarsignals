@@ -52,12 +52,12 @@ C.BLACKOUT_ON = True; TB = datetime(2026, 10, 15, 6, 50, tzinfo=UTC); b.streaks.
 assert b.live_block(TB).startswith("session blackout"); C.BLACKOUT_ON = False; b.streaks.s["live"]["until"] = None
 b.command("/filters"); assert "Filter precedence" in ADM[-1] and "1. pause" in ADM[-1] and "11. :57" in ADM[-1]
 # payout re-check at send time (ensemble path and bug group path)
-b.d.payout_cache = {p: 0.70 for p in C.PAIRS}; sent = []
+b.d.payout_info = lambda p: (0.70, 0.0); sent = []
 b.post_signal = lambda s: sent.append(s)
 for _ in range(400):
     b.d.advance(); T2 = b.d.clock; b.d.now = lambda: T2; b._tick()
-    if any("payout dropped" in m for m in ADM): break
-assert any("payout dropped to 70%" in m for m in ADM) and not sent, "skipped when payout < 77% at send time"
+    if any("payout 70% < 77%" in m for m in ADM): break
+assert any("payout 70% < 77%" in m for m in ADM) and not sent, "skipped when payout < 77% at send time"
 import numpy as np
 xx = __import__("analyzer").compute(pd.DataFrame(dict(open=np.ones(80), high=np.ones(80) * 1.001, low=np.ones(80) * .999, close=np.ones(80)),
                                     index=pd.date_range("2026-10-15 07:00", periods=80, freq="1min", tz="UTC")))

@@ -75,7 +75,11 @@ df["high"] = df[["open", "close"]].max(axis=1) + 1e-4; df["low"] = df[["open", "
 df.loc[df.index[-1], ["open", "high", "low", "close"]] = [1.0985, 1.0996, 1.0930, 1.0994]   # hammer (long lower wick) at the low
 xd = A.compute(df[["open", "high", "low", "close"]]); m_, s_, txt = double_confirm(xd, len(xd) - 1, "CALL"); print("CALL at low:", txt); assert m_ and s_
 m_, s_, txt = double_confirm(xd, len(xd) - 1, "PUT"); print("PUT at low:", txt); assert not (m_ and s_)
-assert not b.dc_ok("test", P, "PUT", xd) and "single-confirmation" in ADM[-1]; assert b.dc_ok("test", P, "CALL", xd)
+n0 = len(ADM); assert not b.dc_ok("test", P, "PUT", xd) and len(ADM) == n0 and b.dc_day["by_dc"]["test"] == 1, "counted, not posted"
+assert "single-confirmation 1 (test 1)" in b.summary_text() and "API budget/stats day" in b.summary_text() and "Trading day (daily loss/profit stops): 08:00" in b.summary_text()
+b.command("/verbose on"); assert C.VERBOSE and json.load(open(os.path.join(C.STATE_DIR, "filters.json")))["verbose"]
+assert not b.dc_ok("test", P, "PUT", xd) and "single-confirmation" in ADM[-1]; b.command("/verbose off"); assert not C.VERBOSE
+assert b.dc_ok("test", P, "CALL", xd)
 b.command("/confirm2 off"); assert not C.DOUBLE_CONFIRM; b.command("/confirm2 on")
 for c_ in ("/cooldown", "/cooldown n 4", "/cooldown min 20", "/cooldown clear live", "/blackout", "/blackout off", "/blackout on", "/news", "/news off", "/news on"): b.command(c_)
 assert C.LOSS_STREAK_N == 4 and C.STREAK_COOLDOWN_MIN == 20 and json.load(open(os.path.join(C.STATE_DIR, "filters.json")))["n"] == 4

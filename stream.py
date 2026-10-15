@@ -242,7 +242,10 @@ class StreamAdapter:
         self._warm_marks = {p: 0 for p in self.pairs}; self._msgs = []
         self.stream = None; self.down = None; self.down_since = None; self._fb_state = None; self._fb_usage = (0.0, None)
         self._load_persisted(); self._rest_warmup()
-        self.payout_cache = self._load_json(C.PAYOUT_CACHE, {}); self.meta_at = 0.0; self.meta = {}
+        pc = self._load_json(C.PAYOUT_CACHE, {})
+        if isinstance(pc, dict) and "payouts" in pc: self.payout_cache, self.payout_ts = pc.get("payouts", {}), pc.get("ts", {})
+        else: self.payout_cache, self.payout_ts = dict(pc or {}), {}    # old flat cache: no timestamps → treated as stale
+        self.meta_at = 0.0; self.meta = {}
         syms = [self.res[p].symbol for p in self.pairs if self.res.get(p) and self.res[p].symbol]
         if mock: mock.connect(self.on_event, syms)
         else:
@@ -450,23 +453,33 @@ class StreamAdapter:
         if b.last_tick and now.timestamp() - b.last_tick > C.STREAM_STALE_SEC: gaps = max(gaps, 1)
         return df, gaps, pair not in self.closed and pair not in self.dropped
     def pair_meta(self):
-        if self.rest_allowed and time.time() - self.meta_at > C.PAYOUT_REFRESH_SEC:
+        # payouts refresh every PAYOUT_REFRESH_SEC; while REST candles are paused for budget, still every PAYOUT_REFRESH_PAUSED_SEC
+        # (one /v1/symbols request) so the 77% floor never runs on stale data
+        every = C.PAYOUT_REFRESH_SEC if self.rest_allowed else C.PAYOUT_REFRESH_PAUSED_SEC
+        if self.rest is not None and time.time() - self.meta_at > every:
             try:
-                m = self.rest.pair_meta(); self.meta_at = time.time()
+                self.rest.meta_at = 0; m = self.rest.pair_meta(); self.meta_at = time.time()
                 for p, (pay, op) in m.items():
-                    if pay is not None: self.payout_cache[p] = pay
-                self._save_json(C.PAYOUT_CACHE, self.payout_cache)
-            except Exception as e: log.warning("payout refresh failed (%s); using cache", e); self.meta_at = time.time()
+                    if pay is not None: self.payout_cache[p] = pay; self.payout_ts[p] = self.meta_at
+                    else: self.payout_cache.pop(p, None); self.payout_ts.pop(p, None)   # unknown now → never keep an old value
+                self._save_json(C.PAYOUT_CACHE, {"payouts": self.payout_cache, "ts": self.payout_ts})
+            except Exception as e: log.warning("payout refresh failed (%s); cached payouts expire after %ss", e, C.PAYOUT_MAX_AGE_SEC); self.meta_at = time.time()
         out = {}
         for p in self.pairs:
-            pay = self.payout_cache.get(p)
-            if pay is None:
-                pay = C.STREAM_FALLBACK_PAYOUT
-                if p not in getattr(self, "_fb_logged", set()):
-                    self._fb_logged = getattr(self, "_fb_logged", set()) | {p}
-                    self._msgs.append(f"ℹ️ {p}: no live/cached payout; using fallback {pay:.0%}")
+            pay, _ = self.payout_info(p)
+            if pay is None and p not in getattr(self, "_fb_logged", set()):
+                self._fb_logged = getattr(self, "_fb_logged", set()) | {p}
+                self._msgs.append(f"⛔ {p}: payout unknown or older than {C.PAYOUT_MAX_AGE_SEC // 60} min → BLOCKED until a fresh payout arrives")
+            elif pay is not None: getattr(self, "_fb_logged", set()).discard(p)
             out[p] = (pay, p not in self.closed)
         return out
+    def payout_info(self, p):
+        """(payout|None, age_seconds|None). Unknown or stale → None (fail closed). Mock source (tests) uses the fixed fallback."""
+        if self.rest is None and self.mock is not None: return C.STREAM_FALLBACK_PAYOUT, 0.0
+        pay, ts = self.payout_cache.get(p), self.payout_ts.get(p)
+        if pay is None or ts is None: return None, None
+        age = time.time() - ts
+        return (pay if age <= C.PAYOUT_MAX_AGE_SEC else None), age
     def usage(self):
         if self.rest:
             try: return self.rest.usage()

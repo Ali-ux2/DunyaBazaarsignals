@@ -40,10 +40,10 @@ b.tg.admin = lambda t: ADM.append(t); b.tg.group = lambda t, chats=None: GRP.app
 P = list(C.PAIRS)[0]; T = pd.Timestamp("2026-10-15 10:00:02", tz="UTC"); b.d.now = lambda: T
 xx = A.compute(walk(200, 5))
 # not enough history → bug filtered (admin only), still paper-tracked
-s = b.bug_fire("*:B6_14", P, "PUT", "t", T, .9, x=xx); assert s["silent"] and any("Filtered by history" in m and "not enough history" in m for m in ADM)
+C.VERBOSE = True; s = b.bug_fire("*:B6_14", P, "PUT", "t", T, .9, x=xx); C.VERBOSE = False; assert s["silent"] and any("Filtered by history" in m and "not enough history" in m for m in ADM)
 assert not GRP and b.hist_day["filtered"] == 1 and s in b.bug_sigs
 # tick strategy: no replayable history → filtered
-b.bug_last_pair.clear(); b.bug_last_pat.clear(); s = b.bug_fire("*:B1", list(C.PAIRS)[1], "PUT", "t", T, .9, kind="now", entry_price=1.0, x=xx)
+b.bug_last_pair.clear(); b.bug_last_pat.clear(); C.VERBOSE = True; s = b.bug_fire("*:B1", list(C.PAIRS)[1], "PUT", "t", T, .9, kind="now", entry_price=1.0, x=xx); C.VERBOSE = False
 assert s["silent"] and "no replayable" in ADM[-1]
 # gate passes (stub) → card shows the history line
 b.hist.check = lambda p, nd, comp, now, pay: (True, "ok", "seen 23× in 30d, 17 won (74%)")

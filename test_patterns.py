@@ -52,9 +52,9 @@ assert s["expiry"] == 2 and s["settle_at"] - s["entry_at"] == timedelta(minutes=
 # double-confirm roles
 C.DOUBLE_CONFIRM = True
 ok, txt = P.p_double_confirm(xx, len(xx) - 1, "P7", "PUT"); assert "P7 gives momentum" in txt
-bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); assert bt.bug_fire("*:P3", list(C.PAIRS)[3], "PUT", "t", T, .9, x=xx) is None and "single-confirmation" in ADM[-1]
+bt.bug_last_pair.clear(); bt.bug_last_pat.clear(); n0 = len(ADM); assert bt.bug_fire("*:P3", list(C.PAIRS)[3], "PUT", "t", T, .9, x=xx) is None and len(ADM) == n0 and bt.dc_day["by_dc"]["pattern P3"] == 1
 # commands / menu / leaderboard
-bt.command("/patterns"); assert "Candle patterns P: ON" in ADM[-1] and "P13" in ADM[-1] and "2m expiry" in ADM[-1]
+bt.command("/patterns"); assert "Drops today: single-confirmation 1 (pattern P3 1)" in ADM[-1] and "filtered by history" in ADM[-1]; assert "Candle patterns P: ON" in ADM[-1] and "P13" in ADM[-1] and "2m expiry" in ADM[-1]
 bt.command("/patterns off"); assert not C.PATTERNS_ON and not bot._on("P1"); bt.command("/patterns on"); assert C.PATTERNS_ON
 _, rows = bt.menu_view("main"); assert "c:/patterns" in [d for r in rows for _, d in r]
 assert any(r[2].startswith("P8 Pattern") for r in bt.leaderboard())

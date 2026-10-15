@@ -60,7 +60,7 @@ PAIR_VARIANTS = {
 }
 RESOLVE_RETRY_MIN = 30
 ALLOW_CROSS_BOOK_FALLBACK = _env("ALLOW_CROSS_BOOK_FALLBACK", default="false").lower() in ("1", "true", "yes")
-CROSS_BOOK_PAYOUT = float(_env("CROSS_BOOK_PAYOUT", default="0.80"))  # Quotex payout assumed for a cross-book pair (check it manually on Quotex)
+CROSS_BOOK_PAYOUT = (float(_env("CROSS_BOOK_PAYOUT", default="")) if _env("CROSS_BOOK_PAYOUT", default="") else None)  # fail closed: unknown unless explicitly set  # Quotex payout assumed for a cross-book pair (check it manually on Quotex)
 FALLBACK_BOOKS = [b for b in _env("FALLBACK_BOOKS", default="otc,iq").split(",") if b]
 
 def symbol_for(pair, book=BROKER_BOOK):
@@ -300,7 +300,9 @@ HIST_GATE = _env("HIST_GATE", default="all").lower()               # all | bugs 
 HIST_MARGIN = float(_env("HIST_MARGIN", default="0.03"))
 HIST_MIN_N = int(_env("HIST_MIN_N", default="15"))
 HIST_W7 = 2                                                          # 7d occurrences weigh double
-HIST_MIN_COVER_DAYS = float(_env("HIST_MIN_COVER_DAYS", default="7"))
+HIST_MIN_COVER_DAYS = float(_env("HIST_MIN_DAYS", "HIST_MIN_COVER_DAYS", default="7"))   # HIST_MIN_DAYS; /history days N
+BUG_WARMUP = _env("BUG_WARMUP", default="on").lower() in ("on", "1", "true", "yes")       # bug group only, while < HIST_MIN_DAYS stored
+BUG_WARMUP_MIN_N = 5; BUG_WARMUP_MARGIN = 0.05; BUG_WARMUP_MAX_HOUR = 4
 HIST_KEEP_DAYS = 30
 HIST_BACKFILL_MAX_REQ = int(_env("HIST_BACKFILL_MAX_REQ", default="800"))
 HIST_BACKFILL_LIMIT = int(_env("HIST_BACKFILL_LIMIT", default="10000"))   # bars per backfill call (OTCharts max may be lower)
@@ -343,3 +345,8 @@ VOLUME_TARGET = int(_env("VOLUME_TARGET", default="4"))
 VOLUME_MAX_HOUR = int(_env("VOLUME_MAX_HOUR", default="6"))           # cap for fills (Tier 2 + 3) per hour
 VOLUME_SLOT_MIN = int(_env("VOLUME_SLOT_MIN", default="10"))          # pace ≈ 1 per 10 min
 VOLUME_GUARD_N = int(_env("VOLUME_GUARD_N", default="40"))            # alert if Tier 3 < breakeven after this many live trades
+VERBOSE = _env("VERBOSE", default="off").lower() == "on"           # per-drop admin notes (single-confirmation / filtered by history)
+SHADOW_CHANNEL_ID = _env("SHADOW_CHANNEL_ID", default="")           # shadow + paper (admin-only/unproven) signals go here; unset = admin chat
+FEEDBACK_KEEP_DAYS = int(_env("FEEDBACK_KEEP_DAYS", default="30"))   # STATE_DIR/feedback/*.jsonl rotation
+PAYOUT_MAX_AGE_SEC = int(_env("PAYOUT_MAX_AGE_SEC", default="600"))   # payout older than this = unknown = BLOCKED (fail closed)
+PAYOUT_REFRESH_PAUSED_SEC = int(_env("PAYOUT_REFRESH_PAUSED_SEC", default="540"))   # payout refresh cadence even when REST candles are paused for budget (~160 req/day)

@@ -560,3 +560,40 @@ Volume mode adds Tier-3 "volume" fills, aiming for 4–6 signals per open hour. 
 - **Safeguard:** if Tier 3 falls below breakeven after ≥ 40 live trades (`VOLUME_GUARD_N`), the admin gets a one-time alert suggesting `/volume off`. Volume mode is never disabled automatically.
 
 **Simulation** (`sim/volume_sim.py`, results in `sim/volume_results.txt`): on 7 days of real FX 1-minute data across 15 pairs, volume mode raises the rate from about 1.2 to about 1.7–2.0 signals per open hour. Only 14–20% of hours land in the 4–6 range. Tier 3 wins about 48–52%, below breakeven, so it adds volume, not edge.
+
+## Quiet drop logging (`/verbose on|off`, default off)
+Signals dropped by double-confirm ("single-confirmation") or by the history gate ("filtered by history") are **counted per source**, not posted one by one. This covers ensemble, bug strategies and patterns. The counts appear in `/stats`, in the daily summary ("🧮 Drops today") and, for patterns, in `/patterns`. `/verbose on` (or env `VERBOSE=on`) turns the per-drop admin messages back on; the setting persists.
+
+The daily summary header shows two separate days:
+- **API budget/stats day:** 03:00 → 03:00 UTC+3.
+- **Trading day for the daily loss/profit stops:** 08:00 → 08:00 UTC+3.
+
+## Shadow channel (`SHADOW_CHANNEL_ID`)
+When this is set, the channel gets exactly what a public group gets, and nothing else:
+- the signal card;
+- the :57 line (✅ CONFIRMED, or 🔄 SWITCH only when the opposite body is ≥ 0.8 ATR);
+- the result, with a chart photo.
+
+This applies to shadow (relaxed) signals and to paper trades from unproven or admin-only bug, strategy and pattern signals. No tags, drop notes, summaries or test messages are sent there. Shadow and paper messages never go to the admin chat one by one. Their stats appear only in /stats and in the daily summary in the admin chat. Shadow results are scored in the original direction. Shadow and paper trades never count toward the daily stops or the cooldown. /status, the menu and the summary show a `📡 Routing` line. At startup the bot checks the channel silently with getChat and getChatMember, so nothing is posted. The admin is alerted only if the bot can't post there, and shadow routing is then off for that run. If the variable is unset, nothing changes.
+
+## Bug-group warm-up (`BUG_WARMUP=on`, `HIST_MIN_DAYS=7`)
+While a pair has fewer than `HIST_MIN_DAYS` of stored candles, the history gate would block every bug signal. In warm-up, a bug signal may still post to the **bug group only** when all of these hold:
+- it was seen at least 5 times in the available history;
+- its win rate is ≥ breakeven + 5 pp;
+- the 7-day window is not clearly negative (if n7 ≥ 5, the 7-day rate must be ≥ breakeven);
+- at most 4 warm-up posts in the last hour;
+- all hard blocks, the payout floor and double-confirm pass.
+
+The admin mirror line gets a 🌱 warm-up tag (the group card does not). Once the history reaches `HIST_MIN_DAYS`, the normal gate applies automatically. Commands: `/history days N` and `/history warmup on|off` (both persisted).
+
+## Feedback log (`/feedback`)
+Per-signal feedback that is no longer sent is stored instead, one JSON line per event, in `STATE_DIR/feedback/YYYY-MM-DD.jsonl`. That covers:
+- single-confirmation drops and history-filtered signals;
+- shadow cards, :57 lines and results (with reason and prices);
+- paper and warm-up bug signals;
+- bug :57 lines and results.
+
+Files older than 30 days are deleted (`FEEDBACK_KEEP_DAYS`). `/feedback` shows today's counts by kind. `/feedback export today|7d|30d` sends a CSV and a JSON file to the admin chat as documents. The menu has 🗂 Feedback and 📤 Export 7d buttons. `/reset feedback` clears the log; it and `/reset all` back up the files to `STATE_DIR/backups/` first.
+
+## Payout floor fails closed
+The 77% floor is checked twice: when a signal is a candidate, and again at send time (`payout_gate`). Both checks cover every path: ensemble Tiers 1/2/3/volume, bug and tick strategies, patterns, warm-up, and shadow-channel cards. A payout counts as known only if it was fetched within the last `PAYOUT_MAX_AGE_SEC` (default 600 s). A missing or stale payout, a cache entry without a timestamp, or a cross-book pair is treated as **blocked**. The old fallbacks (`STREAM_FALLBACK_PAYOUT` 85%, `CROSS_BOOK_PAYOUT` 80%) no longer apply live; the fixed fallback is used only by the mock data source in tests. `CROSS_BOOK_PAYOUT` still works if you set it explicitly. In stream mode, payouts for all pairs refresh every 5 min with one `/v1/symbols` request. While REST candle fetching is paused to save budget, they still refresh every 9 min (`PAYOUT_REFRESH_PAUSED_SEC`), about 160 requests a day. Every signal's candidate and send-time payout is written to the feedback log.

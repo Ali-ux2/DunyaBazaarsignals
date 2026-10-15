@@ -67,6 +67,7 @@ assert "USDPHP" in b.d.pairs
 # no eligible replacement -> 4 pairs
 for p in b.all_pairs:
     if p not in b.d.pairs: fp.meta[p] = (0.70, True)
+b.d.meta_at = 0; b.d.pair_meta()   # payouts are timestamped now: the drop is seen on the next refresh
 b.ladder_update("USDBRL", False); b.ladder_update("USDBRL", False)
 sw = [m for m in msgs if "Stream swap" in m][-1]; print("  ", sw[:160]); assert "no eligible replacement" in sw and len(b.d.pairs) == 4
 saved = json.load(open(C.BENCH_FILE)); print("persisted:", saved["date"], saved["pairs"]); assert set(saved["pairs"]) == {"USDINR", "USDMXN", "USDBRL"}

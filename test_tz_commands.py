@@ -26,6 +26,6 @@ C.TELEGRAM_ADMIN_ID = "12345"; tg = bot.Telegram(); tg.on = True; tg.set_command
 print("setMyCommands:", sent["url"].rsplit("/", 1)[1], sent["body"]["scope"], len(sent["body"]["commands"]))
 assert sent["body"]["scope"] == {"type": "chat", "chat_id": "12345"} and all(not c["command"].startswith("/") for c in sent["body"]["commands"])
 # summary header + a round line in local time
-assert "03:00 UTC+3" in b.summary_text().split("\n")[0]; print("summary:", b.summary_text().split("\n")[0])
+assert "03:00" in "\n".join(b.summary_text().split("\n")[:3]) and "UTC+3" in "\n".join(b.summary_text().split("\n")[:3]); print("summary:", b.summary_text().split("\n")[0])
 out.clear(); b.command("/mode"); print("mode:", out[-1].split("\n")[0]); assert "UTC+3" in out[-1]
 print("\nALL TZ / COMMANDS TESTS PASSED")
