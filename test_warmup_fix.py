@@ -1,7 +1,8 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Warm-up fix: (1) warm-up never overrides a below-BE live record, (2) n≥15 + ≥1 day stored, (3) BLOCKED_SETUPS → shadow paper only, /block persisted."""
 import os, tempfile, json
 SD = tempfile.mkdtemp()
-os.environ.update(DOUBLE_CONFIRM="off", NEWS_FILTER="off", BLACKOUT="off", STATE_DIR=SD, TELEGRAM_ENABLED="0", DATA_SOURCE="replay",
+os.environ.update(SHADOW_MAX_PER_MIN="0", DOUBLE_CONFIRM="off", NEWS_FILTER="off", BLACKOUT="off", STATE_DIR=SD, TELEGRAM_ENABLED="0", DATA_SOURCE="replay",
                   REPLAY_CSV="replay_m1.csv", HIST_GATE="all", PUBLIC_CHANNEL_ID="-1001", VIP_CHANNEL_ID="-1002", BUG_CHANNEL_ID="-1003",
                   SHADOW_CHANNEL_ID="-1004", GROUP_FILTER="all", PATTERNS="off")
 os.environ.pop("BLOCKED_SETUPS", None); os.environ.pop("BUG_WARMUP_MIN_N", None)

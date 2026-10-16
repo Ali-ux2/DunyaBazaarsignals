@@ -1,7 +1,8 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Bug signals: planted triggers for B1-B6/E/F, random data mostly silent, no lookahead, rate limits, routing per
 /bugsignals mode, resolution + auto-demote, telemetry, leaderboard. Synthetic data only: proves mechanics, NOT edge."""
 import os, tempfile, json
-os.environ.update(DOUBLE_CONFIRM="off", NEWS_FILTER="off", BLACKOUT="off", HIST_GATE="off", STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv")
+os.environ.update(SESSIONS="off", MTF="off", MIN_SCORE="0", SPACING_MIN="0", DOUBLE_CONFIRM="off", NEWS_FILTER="off", BLACKOUT="off", HIST_GATE="off", STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv")
 import numpy as np, pandas as pd, config as C, analyzer as A, bot, bugstrats as S
 C.VERBOSE = True   # this test inspects the per-signal bug admin mirror (off by default; feedback log instead)
 from datetime import timedelta
@@ -65,6 +66,7 @@ for k, f in fns.items():
 print("no-lookahead OK:", list(fns))
 
 # ---------- pipeline: rate limits, routing, resolution, demotion ----------
+import quant as Q; Q.MT_METHOD = "off"   # legacy routing test: tiny samples; BH promotion is covered in test_quant.py
 b = bot.Bot(bot.ReplayAdapter("replay_m1.csv")); adm, grp = [], []
 b.tg.admin = lambda t: adm.append(t); b.tg.group = lambda t, chats=None: grp.append(t); b.tg.group_photo = lambda *a, **k: False
 PS = list(C.PAIRS); T = pd.Timestamp("2026-01-05 10:00:02", tz="UTC"); b.d.now = lambda: T
@@ -77,7 +79,7 @@ f2 = b.bug_fire("*:B3", P, "PUT", "test", T + timedelta(minutes=1), 0.85, x=xx);
 f3 = b.bug_fire("*:B2", PS[1], "PUT", "t", T + timedelta(minutes=2), 0.85, x=xx); assert f3["silent"], "pattern cooldown 5 min"
 assert b.bug_fire("*:B2", P, "CALL", "t", T, 0.70, x=xx) is None, "77% floor"
 b.pending = {"pair": PS[2]}; assert b.bug_fire("*:B6_14", PS[2], "CALL", "t", T, 0.9, x=xx) is None, "pending group trade"; b.pending = None
-C.GROUP_FILTER = "all"
+C.GROUP_FILTER = "all"; b.q["corr_on"] = False   # same pair+minute is re-fired below on purpose
 b.bugs["*:F"]["fw"] = [15, 5]   # proven for public/VIP routing tests
 for mode, cand, expect in (("admin", False, 0), ("group", False, 1), ("candidates", False, 0), ("candidates", True, 1), ("off", False, 0)):
     b.bug_last_pair.clear(); b.bug_last_pat.clear(); b.bugsignals_cmd([mode]); g0, a0 = len(grp), len(adm)

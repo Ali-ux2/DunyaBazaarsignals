@@ -1,3 +1,4 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Scheduled posts + event hooks: UTC+3 time triggers (daily/once/weekdays), capture of sticker/photo/forward, forward/copy/pin
 API calls, rate limiting, error reporting (pin permission), session start/close + daily target + first bug signal hooks."""
 import os, tempfile, json, time

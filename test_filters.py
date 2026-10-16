@@ -1,3 +1,4 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Loss-streak cooldown (live + bug separately, ties ignored, persisted), session blackouts (DST via zoneinfo), news blackout
 (mocked ForexFactory feed, per-currency, cache + one-time alert), double confirmation, quota excludes blocked minutes, commands/menu."""
 import os, tempfile, json
@@ -25,9 +26,9 @@ st = Streaks(); t0 = datetime(2026, 10, 15, 8, 0, tzinfo=UTC)
 assert st.result("live", "LOSS", t0) is None and st.result("live", "TIE", t0) is None and st.result("live", "LOSS", t0) is None
 st.result("live", "WIN", t0); assert st.s["live"]["n"] == 0, "win resets"
 for r in ("LOSS", "LOSS"): st.result("live", r, t0)
-u = st.result("live", "LOSS", t0); assert u == t0 + timedelta(minutes=30) and st.frozen("live", t0 + timedelta(minutes=29)) and not st.frozen("bug", t0)
+u = st.result("live", "LOSS", t0); assert u == t0 + timedelta(minutes=120) and st.frozen("live", t0 + timedelta(minutes=119)) and not st.frozen("bug", t0)
 assert Streaks().frozen("live", t0 + timedelta(minutes=5)), "persisted across restart"
-assert st.expired("live", t0 + timedelta(minutes=31)) and not st.expired("live", t0 + timedelta(minutes=32))
+assert st.expired("live", t0 + timedelta(minutes=121)) and not st.expired("live", t0 + timedelta(minutes=122))
 # ---- news (mocked feed) ----
 feed = [{"title": "Non-Farm Employment Change", "country": "USD", "date": "2026-10-15T08:30:00-04:00", "impact": "High"},
         {"title": "German ZEW", "country": "EUR", "date": "2026-10-15T05:00:00-04:00", "impact": "Medium"},
@@ -55,7 +56,8 @@ s = b.bug_fire("*:B6_14", P, "PUT", "t", T, .9, x=xx); assert s and [c for c in 
 # bug group's own streak
 for _ in range(3): b.streak_result("bug", "LOSS")
 b.bug_last_pair.clear(); b.bug_last_pat.clear(); s = b.bug_fire("*:B6_20", list(C.PAIRS)[2], "PUT", "t", T, .9, x=xx); assert not s.get("group"), "bug group cooling down"
-T = T + timedelta(minutes=31); b.filters_tick(T); assert any("cooldown over (public/VIP)" in m for m in ADM) and any("cooldown over (bug group)" in m for m in ADM)
+T = T + timedelta(minutes=31); b.filters_tick(T); assert any("cooldown over (bug group)" in m for m in ADM) and not any("cooldown over (public/VIP)" in m for m in ADM), "bug 30 min, VIP/public 120 min"
+T = T + timedelta(minutes=90); b.filters_tick(T); assert any("cooldown over (public/VIP)" in m for m in ADM)
 assert not b.live_block(T)
 # session blackout start/end notes + bug group blocked; quota excludes blocked minutes
 TB = datetime(2026, 10, 15, 6, 50, tzinfo=UTC); b.filters_tick(TB); assert "Session blackout" in ADM[-1]

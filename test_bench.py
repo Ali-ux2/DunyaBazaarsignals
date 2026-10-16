@@ -1,6 +1,6 @@
 """Bench after 2 lost ladders + stream swap + midnight restore (mock feed). Derived from the auto-mode dry-run: poll 12 pairs -> stream at 93% -> back to poll after midnight reset. Mocked feed, no network."""
 import os, tempfile
-os.environ.update(STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="otcharts", MODE="auto")
+os.environ.update(STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="otcharts", MODE="auto", STREAM_PAIRS="USDINR,USDPKR,USDCOP,USDMXN,USDBRL")
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import config as C; C.USAGE_CHECK_SEC = 0

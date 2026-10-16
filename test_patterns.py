@@ -1,3 +1,4 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Pattern family P: detectors on hand-built candles, causality, history mandatory even with HIST_GATE=off, admin-only until
 ≥20 forward ≥ BE, then bug group; P13 2-minute expiry; P11 30s bars; double-confirm roles; /patterns + menu; /best lists P."""
 import os, tempfile

@@ -1,3 +1,4 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Bug-group warm-up: while stored history < HIST_MIN_DAYS, n≥5 & win ≥ BE+5pp & 7d not negative → bug group only, ≤4/h,
 'warm-up' tag in admin mirror only; ≥ HIST_MIN_DAYS stored → normal gate; /history days N."""
 import os, tempfile

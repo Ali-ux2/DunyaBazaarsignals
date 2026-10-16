@@ -3,7 +3,7 @@ import os, sys, tempfile, importlib, json
 from datetime import timedelta
 def fresh(env):
     for k in ("PUBLIC_CHANNEL_ID", "VIP_CHANNEL_ID", "TELEGRAM_CHANNEL_ID"): os.environ.pop(k, None)
-    os.environ.update(STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv", **env)
+    os.environ.update(SESSIONS="off", MTF="off", MIN_SCORE="0", SPACING_MIN="0", STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv", **env)
     for m in ("config", "analyzer", "chart", "resolver", "bot"): sys.modules.pop(m, None)
     import bot; return bot
 def mkbot(bot):

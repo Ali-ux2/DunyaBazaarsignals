@@ -14,7 +14,7 @@ b.tg.admin = lambda t: out.append(t); b.tg.group = lambda t, chats=None: out.app
 h = b.handlers(); listed = {c for _, c, _ in b.COMMANDS}
 missing = listed - set(h); unlisted = set(h) - listed - {"/help", "/testcard"}
 print("listed:", len(listed), "handlers:", len(h), "missing:", missing, "unlisted:", unlisted); assert not missing and not (unlisted - {'/start'})   # /start = hidden alias of /menu
-for c in sorted(listed - {"/public", "/vip", "/both", "/stream", "/poll", "/auto", "/pause", "/resume", "/menu", "/start"}): out.clear(); b.command(c); assert out, c
+for c in sorted(listed - {"/public", "/vip", "/both", "/stream", "/poll", "/auto", "/pause", "/resume", "/menu", "/start", "/howitworks"}): out.clear(); b.command(c); assert out, c
 b.command("/commands"); txt = out[-1]; b.command("/help"); assert out[-1] == txt
 assert all(f"<b>{g}</b>" in txt for g in ("Control", "Stats", "Channels", "Mode", "Test")); print(txt)
 # setMyCommands payload (scoped to admin chat)

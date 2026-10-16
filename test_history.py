@@ -1,3 +1,4 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """History gate: store merge/trim, bounded backfill, occurrence replay (no lookahead, incremental), thresholds (n, Wilson LB + margin,
 7d veto, coverage), gate on ensemble/bug/shadow → admin 'filtered by history' + paper-tracked, card line, /stats count, /history + menu."""
 import os, tempfile, json

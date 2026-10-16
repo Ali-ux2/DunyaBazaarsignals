@@ -1,3 +1,4 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Telegram HTML safety: every outgoing HTML payload (cards, :57, results for public/VIP/bug/shadow/paper, alerts, summaries,
 menu, feedback, payout block, history/warm-up notes) passes a validator mimicking Telegram's parser; parse-error fallback to plain text;
 bug/shadow routing goes to BUG_CHANNEL_ID / SHADOW_CHANNEL_ID with no per-signal bug/shadow text in the admin chat."""

@@ -1,8 +1,9 @@
+import os; os.environ.setdefault("BUG_GATE", "off"); os.environ.setdefault("HOLDOUT", "off")   # legacy test of the pre-gate promotion rules (gate: test_buggate.py)
 """Per-channel double-confirmation split: DC ON for VIP/public/bug, OFF for shadow/paper by default.
 /confirm2 on|off = main switch; /confirm2 shadow on|off = shadow; both persisted in STATE_DIR/filters.json; nothing reset."""
 import os, json, tempfile
 SD = tempfile.mkdtemp()
-os.environ.update(STATE_DIR=SD, TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv",
+os.environ.update(SHADOW_MAX_PER_MIN="0", STATE_DIR=SD, TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv",
                   HIST_GATE="off", BLACKOUT="off", NEWS_FILTER="off", DOUBLE_CONFIRM="on", PATTERNS="on", VOLUME_MODE="off",
                   PUBLIC_CHANNEL_ID="-1001", VIP_CHANNEL_ID="-1002", BUG_CHANNEL_ID="-1003", SHADOW_CHANNEL_ID="-1004",
                   SHADOW_RELAXED="1", GROUP_FILTER="all", TELEGRAM_ADMIN_ID="42")

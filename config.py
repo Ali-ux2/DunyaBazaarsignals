@@ -50,7 +50,7 @@ BUDGET_WARN     = 0.80
 BUDGET_PAUSE    = 0.95
 USAGE_CHECK_SEC = 300
 
-_DEFAULT_PAIRS = ["USDBRL", "USDMXN", "USDINR", "USDPKR", "USDDZD", "USDARS", "USDBDT", "USDCOP", "USDIDR", "USDPHP", "USDEGP", "USDNGN", "NZDUSD", "USDZAR", "EURNZD"]
+_DEFAULT_PAIRS = ["USDBRL", "USDMXN", "USDINR", "USDPKR", "USDARS", "USDBDT", "USDCOP", "USDEGP", "USDNGN", "USDPHP"]
 # All 12 enabled; the live payout gate (MIN_PAYOUT 77%) filters low-payout pairs per signal.
 DISABLED_PAIRS: list = []   # move pairs here (and out of _DEFAULT_PAIRS) to disable
 PAIRS = [p.strip().upper() for p in _env("PAIRS", default=",".join(_DEFAULT_PAIRS)).split(",") if p.strip()]
@@ -150,6 +150,8 @@ ALLOW_CONFLICT = False   # strict: any opposing vote rejects the setup
 SHADOW_RELAXED = _env("SHADOW_RELAXED", default="1").lower() in ("1", "true", "yes", "on")
 SHADOW_STATS_FILE = os.path.join(STATE_DIR, "shadow_stats.json")
 SHADOW_LOG = os.path.join(STATE_DIR, "shadow_trades.csv")
+SHADOW_MAX_PER_MIN = max(0, int(_env("SHADOW_MAX_PER_MIN", default="1")))   # shadow channel: max cards per entry minute (strongest wins); 0 = unlimited. /shadowcap <n>
+SHADOW_CAP_FILE = os.path.join(STATE_DIR, "shadow_cap.json")
 SHADOW_MAX_WAIT_MIN = 20     # give up resolving a shadow trade if its candle never shows up in already-fetched data
 # Overrides applied ONLY inside the shadow evaluation. Payout floor (MIN_PAYOUT) and gap rejection are NOT relaxed.
 SHADOW_OVERRIDES = dict(
@@ -236,7 +238,7 @@ ROLLING_N = 50
 MIN_TRADES_FOR_GATE = 30
 
 # ---- stream mode ----
-STREAM_PAIRS = [p.strip().upper() for p in _env("STREAM_PAIRS", default="USDINR,USDIDR,USDCOP,USDMXN,USDBRL").split(",") if p.strip()]
+STREAM_PAIRS = [p.strip().upper() for p in _env("STREAM_PAIRS", default="USDBRL,USDMXN,USDINR,USDPKR,USDARS").split(",") if p.strip()]
 STREAM_MAX_INSTRUMENTS = int(_env("STREAM_MAX_INSTRUMENTS", default="5"))   # Lite plan: 1 stream x 5 instruments
 STREAM_429_BACKOFF_SEC = 300       # legacy (unused)
 STREAM_429_BACKOFFS = [60, 120, 300, 600]   # 429 retry schedule, capped at 600 s
@@ -363,3 +365,10 @@ SHADOW_CHANNEL_ID = _env_chat("SHADOW_CHANNEL_ID", default="")      # shadow + p
 FEEDBACK_KEEP_DAYS = int(_env("FEEDBACK_KEEP_DAYS", default="30"))   # STATE_DIR/feedback/*.jsonl rotation
 PAYOUT_MAX_AGE_SEC = int(_env("PAYOUT_MAX_AGE_SEC", default="600"))   # payout older than this = unknown = BLOCKED (fail closed)
 PAYOUT_REFRESH_PAUSED_SEC = int(_env("PAYOUT_REFRESH_PAUSED_SEC", default="540"))   # payout refresh cadence even when REST candles are paused for budget (~160 req/day)
+
+# ---- admin jobs (adminjobs.py); times are DISPLAY time (UTC+3 by default) ----
+WEEKLY_REPORT_AT = (21, 0)       # Sunday, admin chat only
+BACKUP_AT = (23, 55)             # daily STATE_DIR backup zip to admin chat
+PROMO_AT = (22, 0)               # VIP results promo preview → admin (Approve/Skip)
+PROMO_EXPIRE_H = 12
+PROMO_DEFAULT_ON = _env("PROMO", default="1") not in ("0", "false", "off")

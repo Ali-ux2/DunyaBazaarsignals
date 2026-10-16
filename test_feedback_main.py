@@ -1,7 +1,7 @@
 """VIP/public signals + results are written silently to the feedback log (vip_signal/vip_result, public_*), bug_group_result distinct;
 nothing extra posted to channels or admin; /feedback today lists the new kinds; stats untouched."""
 import os, sys, tempfile, json
-os.environ.update(STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv",
+os.environ.update(SESSIONS="off", MTF="off", MIN_SCORE="0", SPACING_MIN="0", STATE_DIR=tempfile.mkdtemp(), TELEGRAM_ENABLED="0", DATA_SOURCE="replay", REPLAY_CSV="replay_m1.csv",
                   PUBLIC_CHANNEL_ID="-100PUB", VIP_CHANNEL_ID="-100VIP")
 import bot, feedback as FB
 b = bot.Bot(bot.ReplayAdapter("replay_m1.csv")); out = []

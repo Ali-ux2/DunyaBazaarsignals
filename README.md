@@ -125,7 +125,7 @@ breakeven gate active. If no pair qualifies, the slot stays empty and this is lo
 
 # Stream package (otc_bot_stream)
 `MODE=stream` (default here) reads live prices from **one** OTCharts `/v1/stream` connection carrying
-`STREAM_PAIRS` (default `USDINR,USDIDR,USDCOP,USDMXN,USDBRL`; max `STREAM_MAX_INSTRUMENTS`=5 on Lite) and builds M1 candles from ticks.
+`STREAM_PAIRS` (default `USDBRL,USDMXN,USDINR,USDPKR,USDARS`; max `STREAM_MAX_INSTRUMENTS`=5 on Lite) and builds M1 candles from ticks.
 `MODE=poll` is the original once-a-minute `/v1/candles` bot. `MODE=auto` polls and switches to the stream when the budget hits 95%.
 
 **Facts from otcharts.com/api.html (14 Oct 2026):**
@@ -633,3 +633,96 @@ Every signal and result sent to VIP or PUBLIC is also written silently to the fe
 `bug_group_result` for results posted in the bug group. Fields: ts, pair, dir, destination, entry_at, payout, tier, source, pattern,
 dc, hist, level, result (WIN/LOSS/TIE), open, close. Bug signals that also reach VIP/public log with source `bug <key>`.
 Nothing new is sent to any channel or admin; `/feedback` lists the new kinds and `/feedback export` includes them. No extra API requests, routing/stats unchanged.
+
+## Shadow cap (1 signal per minute)
+Shadow channel posts at most `SHADOW_MAX_PER_MIN` cards per entry minute (default 1, 0 = unlimited), picking the strongest (confidence/score, then live win rate, then payout). The rest are tracked silently as paper (stats and bug promotion keep their data). Change live with `/shadowcap <n>` (saved in STATE_DIR, shown in /status). VIP/public/bug group unaffected.
+
+## Pairs (Oct 16 update)
+Default `PAIRS`: USDBRL, USDMXN, USDINR, USDPKR, USDARS, USDBDT, USDCOP, USDEGP, USDNGN, USDPHP (10). Default `STREAM_PAIRS`: USDBRL, USDMXN, USDINR, USDPKR, USDARS.
+If `PAIRS` or `STREAM_PAIRS` is set in Railway Variables it overrides these defaults — delete it (or update it) to use this list. Stored history for removed pairs stays on disk unused; stats are not reset.
+
+## Admin jobs (adminjobs.py) — admin private chat only
+- **Weekly results**: Sunday 21:00 UTC+3, and `/weekly` on demand: last-7-day win rate per channel (VIP/public/bug/shadow), per pair, per hour, from the stored feedback log. `/weekly tune` unchanged.
+- **Daily backup**: 23:55 UTC+3, and `/backup`: zip of STATE_DIR .json/.jsonl/.csv/.txt (stats, streaks, freeze, feedback, level…). No env/secrets; files with secret/token/key/cred in the name are skipped. Last 3 kept in STATE_DIR/daily_backups/. No /restore (not built — restoring live state from chat is risky; restore manually if ever needed).
+- **VIP promo**: 22:00 UTC+3, a preview of "VIP results today: xW–yL" goes to the admin chat with Approve / Skip. Only Approve posts it to PUBLIC_CHANNEL_ID. Expires unapproved after 12 h; skipped when VIP had 0 trades. `/promo on|off|now` (default on; env `PROMO=0` to default off).
+
+## Audit log, signal IDs, config versions (admin only)
+- Every signal candidate (VIP/public, bug group, shadow posted/capped, confirm2-dropped, paper) gets an ID like `DBS-20261016-A3F7`, kept in the admin chat, the feedback log, `trades.csv`/`shadow_trades.csv` (new last column `id`) and exports. **Channels never show IDs.**
+- `STATE_DIR/audit/audit-YYYY-MM-DD.jsonl`: append-only, one JSON line per event (created, confirm2_pass/drop, blocked, routed, capped, posted + Telegram message_id, precheck_57, result, pause/resume/freeze/level, config_version, reliability). Hash-chained (`prev_hash` + `hash`); 90 days kept.
+- `/audit verify` (chain OK/BROKEN) · `/audit DBS-20261016-A3F7` (full trail) · `/audit export today|7d|30d`.
+- `STATE_DIR/config_versions.jsonl`: every change of the effective settings (level, confirm2, blocks, shadow cap, pairs, filters, promo…) bumps vN→vN+1 with a diff (secrets never stored). Every audit/feedback row carries `config_version`. `/config`, `/config history`. The weekly report shows win rate per config version.
+- All of it is in the daily `/backup`.
+
+## Onboarding
+- `/howitworks` → preview with Approve/Skip; Approve posts to PUBLIC and pins (re-approve edits the pinned post). The bot needs admin rights in the public channel to pin; if pinning fails the admin chat says so. `/howitworks set <text>`, `/howitworks reset`.
+- Non-admin users who send `/start` to the bot privately get the welcome text once per 24 h. `/welcome preview`, `/welcome set <text>`, `/welcome reset`. Admin `/start` still opens the menu.
+
+## Reliability & safety
+- **API circuit breaker**: >20% OTCharts errors over 10 min (min 10 calls) → new signals paused (separate from /pause), admin alert; auto-resumes after 5 min below 10%. Open trades still settle.
+- **Degradation**: paid API → stream → no new signals. Stale/cached data never produces a signal (77% floor stays fail-closed); cached candles are only used to settle results. Admin alert on every transition.
+- **Memory** (>85% of the container limit, max 1 alert/30 min) and **volume** checks every minute (STATE_DIR exists, is writable, is a mounted volume).
+- **Telegram flood protection**: ~1 msg/s per chat, ~20/min per channel, ~25/s overall; messages are queued, never dropped; :57 lines and results go first; 429 `retry_after` honoured.
+- **Deadman**: a watchdog thread alerts the admin if the main loop hasn't ticked for 10 min. `/status` shows breaker, data source, memory and last tick.
+
+### External health check (UptimeRobot)
+1. Railway → worker → Settings → Networking → **Generate Domain** (Railway sets `PORT`; the bot serves `GET /health`).
+2. Open `https://<your-domain>/health`: 200 `{"ok": true, "last_tick_age_s": …}`; 503 if the loop hasn't ticked for 10 min.
+3. uptimerobot.com → Add monitor → HTTP(s) → that URL, every 5 min.
+4. Alert contacts → add **Telegram** (follow UptimeRobot's bot link) so you get a message when it goes down.
+If no `PORT` is set the endpoint is simply off; nothing else changes.
+
+## Statistical guards (VIP / public / bug only; shadow is only tagged)
+All are conservative extra blocks on top of the existing rules (77% payout fail-closed, :57 line, 3-loss freeze, daily stop). A blocked signal goes to shadow/paper tracking.
+| Guard | Rule | Config (Railway vars) / command |
+|---|---|---|
+| Correlation cap | pairs whose 1-min returns correlate > 0.6 over 120 bars form a cluster; max 1 signal per cluster per minute per channel. VIP/public: the strongest candidate is chosen first; bug: first to fire in that minute | `CORR_CAP`, `CORR_BARS`, `CORR_THRESH`, `/corrcap on|off` |
+| Hour seasonality | an hour (UTC+3) is blocked when it has ≥30 settled VIP/public/bug trades in 30 days and its Wilson upper bound < break-even | `HOUR_BLOCK`, `HOUR_MIN_N`, `/hours list|unblock <h>|reblock <h>` |
+| ATR throttle | ATR(14) percentile vs the pair's last 30 days of stored candles; block if < 20th or > 80th. Skipped with < 3 days of history | `ATR_THROTTLE`, `ATR_LO_PCT`, `ATR_HI_PCT`, `ATR_MIN_DAYS` |
+| Bayesian pause | Beta(10,10) prior on each pattern's live record; pause when P(win rate > BE) < 0.1 with ≥ 20 trades, resume when > 0.5 | `BAYES_PAUSE`, `BAYES_*` |
+| Pattern decay | last 14 days vs the pattern's earlier baseline; > 2 SD below with ≥ 30 recent trades → retired (shadow-only), admin alert, shown in `/block list`; `/block remove <key>` un-retires | `PATTERN_DECAY`, `DECAY_*` |
+| Multiple testing | bug-group promotion needs a one-sided binomial test vs break-even that survives Benjamini-Hochberg at FDR 10% across all setups being evaluated (`MT_METHOD=wilson` instead needs Wilson LB ≥ BE + 2 pts; `off` = old rule). Expect fewer bug-group setups | `MT_METHOD`, `MT_FDR`, `MT_WILSON_MARGIN` |
+| Self-tune guard | weekly self-tune is applied only if it also wins on a held-out window (tune on older 70%, validate on newest 30%); otherwise it's rejected and logged | `WF_HOLDOUT` |
+- Each signal's audit trail gets a `features` event: analyzer version (hash of analyzer/patterns/bugstrats/quant code), config_version, all votes, ADX/ER, ATR percentile, regime (trending/ranging/volatile/quiet), hour, payout, pattern and the sha256 of the input candles.
+- `STATE_DIR/features.jsonl`: one `signal` row and one `outcome` row per id, for future meta-labelling. The weekly report adds win rate by hour and weekday per channel, by regime, and by config version.
+- `/status` shows a `Guards:` line.
+
+## VIP / public quality filters (shadow only tags pass/fail in audit + features.jsonl)
+| Filter | Default | Command / var |
+|---|---|---|
+| Pair windows (UTC+3) | london 10:00–11:30 BRL,MXN,COP,ARS · ny_open 16:30–18:00 MXN,BRL,ARS · ny_late 20:00–21:30 MXN,INR · asian 03:00–05:00 INR,PKR,BDT (off). VIP/public only when inside an enabled window AND the pair is listed; otherwise shadow/paper. Shadow tags in_window. Bug group only if `/windows bug on`. Persisted in STATE_DIR/chanfilters.json; changes bump the config version; weekly report shows win rate per window and per pair in window | `/windows` · `/windows on|off <name>` · `/windows set <name> HH:MM-HH:MM PAIR,PAIR` · `/windows off|on` (whole filter) |
+| Spacing | max 1 signal per 15-min block, per channel (VIP's strongest candidate is chosen first) | `SPACING_MIN`, `/spacing <min>` |
+| Minimum score | 6 on the 7-vote scale. The bot scores in confidence % (score ÷ max score), so 7-vote score = confidence × 7 ÷ 100; 6/7 ≈ 86% confidence. Bug-pattern signals have no vote score, so they don't reach VIP/public while this is on (fail-closed) | `MIN_SCORE`, `/minscore <0-7>` |
+| Multi-timeframe | M5 and M15 are built from stored 1-min candles (no API calls). Trend = close vs EMA20 and EMA20 slope on closed bars; CALL needs both up, PUT both down. Too few candles → fail | `MTF`, `/mtf on|off` |
+| ATR band | 20th–80th percentile | `ATR_LO_PCT`, `ATR_HI_PCT` |
+| Loss freeze | 3 losses in a row → VIP/public 120 min (`FREEZE_MIN_VIP`/`FREEZE_MIN_PUBLIC`; VIP and public share one streak counter, the longer setting applies), bug group 30 min | |
+All shown in `/status`. The weekly report has win rate by score bucket.
+
+## Drawdown
+Flat 1-unit stakes per channel (VIP, public, bug, shadow), using each trade's actual payout: P&L, max drawdown, current drawdown and the worst rolling 20-trade window, in units and % of a notional 20-unit bank (`DD_BANK`). Shown in `/stats`, `/drawdown` and the weekly report. When VIP's or public's worst 20-trade window or current drawdown reaches `DD_ALERT` (default −15% of the bank), the admin gets a private alert (max once per 6 h). With `DD_AUTOPAUSE=on` that channel is also paused (its signals go to paper) until `/drawdown resume vip|public`. `/stats` also shows the score 6–7 bucket separately from < 6.
+
+### Drawdown ladder (VIP and public, separately; shadow and bug unaffected)
+Measured as the current drawdown from the peak of each channel's 30-day flat-stake curve, as a % of the 20-unit bank. Each step alerts once in the admin chat (nothing is posted to channels):
+−10% → "consider reducing stake to 1.5%" · −15% → "reduce to 1%" · −20% → that channel paused 4 h · −30% → paused until 00:00 UTC+3 · −40% → paused until Monday 00:00 UTC+3 or `/ddresume`.
+After `/ddresume`, the next deeper step alerts and pauses again. Once the drawdown recovers above −10%, the ladder re-arms. Paused-channel signals go to paper. `/ddladder` shows the state, and `/status` shows a `DD ladder` line. Variables: `DD_LADDER_ON`, `DD_LADDER` (default `-0.10,-0.15,-0.20,-0.30,-0.40`), `DD_LADDER_PAUSE_H`. Every step is written to the audit log, and the ladder settings are part of the config version.
+
+### Pair auto-removal (VIP/public)
+Rolling 30-day live record per pair (VIP + public + bug results; shadow is shown separately and never decides). A pair with ≥ 30 settled trades whose Wilson upper bound is below its own break-even (1 / (1 + its average actual payout)) is removed from VIP/public; shadow and bug keep it. It comes back when its Wilson lower bound reaches break-even − 2 points, or when its last 30 trades are above break-even. Each change sends an admin alert and an audit entry. `/pairstats` shows per-pair 30-day win rate, break-even, expectancy per $1 and status. `/pairs enable <PAIR>` overrides the removal, and `/pairs auto <PAIR>` returns the pair to automatic. The weekly report shows per-pair expectancy from actual payouts. Variables: `PAIR_GUARD`, `PG_MIN_N`, `PG_REENABLE_MARGIN`. No stake sizing.
+
+## Bug system: holdout + promotion gate (replaces the old forward-count and warm-up promotion)
+1. **Holdout** (`holdout.py`): the pattern scanner looks only at the oldest 70% of a pair's stored candles (up to 7 days). A pattern found there must beat break-even on the newest 30%, which discovery never sees, with ≥ 30 samples. Only then does it start paper trading. Rejections are written to the feedback log (`holdout_reject`) and the audit log. Too little data means nothing is accepted. Variables: `HOLDOUT`, `HO_DISCOVERY_FRAC`, `HO_MIN_N`, `HO_MIN_BARS`.
+2. **Promotion gate** (`buggate.py`). Every check must pass:
+   - ≥ 50 paper trades (`GATE_MIN_N`)
+   - 90% Wilson lower bound > break-even + 2 points, with break-even from the actual payouts (`GATE_MARGIN`)
+   - paper drawdown < 15 units (`GATE_MAX_DD`)
+   - setups that trade several pairs: no pair with > 50% of the wins. This check is skipped for single-pair patterns, where it would always fail.
+   - effect size on the 50-trade window: wins − break-even × 50 ≥ 4 (`GATE_EFFECT`, default 4). At a 54% break-even that means ≥ 31 wins of 50 (62%). The 90% Wilson rule is stricter still: it needs about 35/50 (70%).
+   - multiple-testing correction across the N setups being evaluated: one-sided binomial test vs break-even with Bonferroni α 0.05/N by default; `BUG_MT=bh` uses Benjamini-Hochberg instead.
+   - not a duplicate: P&L correlation > 0.7 (daily, or hourly when there's too little data) with a setup already promoted means rejected as a duplicate of it (`GATE_DUP_CORR`)
+   - not retired, not blocked (P8/P14/P6b stay blocked).
+   Warm-up only applies to setups that also pass the gate. `BUG_GATE=off` restores the old rules.
+3. **Setup × pair matrix**: a promoted setup posts to the bug group only on pairs where that setup has ≥ 15 trades and a Wilson lower bound ≥ break-even; other pairs stay paper. `/bugmatrix`.
+4. **Retire to shadow** when any of these happens: the last 100 trades' win rate < break-even − 1 point, 200 trades without a new equity high, or 10 losses in a row. Admin alert and audit entry. Variables: `RETIRE_*`.
+- `/bugstatus` lists every setup with paper trades and which checks it fails. Promotions, losses of promotion, retirements and holdout rejections go to the audit log, and the gate settings are part of the config version.
+- **Rolling window** (`BUG_WINDOW=50`, kept in STATE_DIR inside bug_watch.json): the gate judges each setup's last 50 trades. A newly accepted pattern setup is seeded once with its 50 most recent historical matches from stored candles: outcome from the next candle, the pair's current/typical payout, `source=hist`. Every live paper or posted result is appended as `source=live` and pushes out the oldest entry, so after 50 live trades the window is fully live. Restarts and rescans never re-seed a setup that already has a window. Named B-strategies can't be replayed from candles, so their window fills from live results only.
+- Promotion also needs at least `BUG_MIN_LIVE=25` live entries in the window. Holdout, Bonferroni, the confidence interval, drawdown, duplicate, matrix and decay rules all still apply (decay uses the full live history). `/bugstatus` shows hist/live counts per setup.
+- **Expected effect:** no promotions until a setup has 25 live trades, and then only setups running at about 70% or better over the window.

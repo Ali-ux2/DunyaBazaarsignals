@@ -27,7 +27,8 @@ class Streaks:
         elif res == "LOSS":
             st["n"] += 1
             if st["n"] >= C.LOSS_STREAK_N:
-                st["n"] = 0; until = now + timedelta(minutes=C.STREAK_COOLDOWN_MIN); st["until"] = until.isoformat(); self.save(); return until
+                st["n"] = 0; until = now + timedelta(minutes=(max(int(os.environ.get("FREEZE_MIN_VIP", "120")), int(os.environ.get("FREEZE_MIN_PUBLIC", "120")))
+                                                             if kind == "live" else C.STREAK_COOLDOWN_MIN)); st["until"] = until.isoformat(); self.save(); return until
         self.save(); return None
     def frozen(self, kind, now):
         u = self.s[kind].get("until")
