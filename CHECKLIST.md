@@ -56,3 +56,18 @@
 - [PASS] silent: nothing sent to admin/groups/shadow
 - [PASS] /confirm2 and /filters show passed vs dropped with n, Wilson LB, BE
 - [PASS] full suite 29/29
+
+## Per-channel DC split (2026-10-15) — test_dc_split
+- [PASS] Defaults: DC on for VIP/public/bug and off for shadow
+- [PASS] A DC-failing proven bug signal never reaches bug/VIP/public; it goes to shadow paper and the drop is still paper-scored
+- [PASS] `/confirm2 shadow on` → DC failures are dropped everywhere; `/confirm2 off` still controls VIP/public/bug
+- [PASS] dc / dc_shadow are saved in filters.json and reloaded
+- [PASS] The shadow engine uses the shadow switch; shadow posts are clean cards only
+- [PASS] /confirm2 status line and the menu button; "passed" stats exclude shadow DC-off results
+- [PASS] Full suite: 30/30 test files pass; no /reset called, no state files touched
+
+## VIP/public feedback rows
+- [ ] After a VIP/public signal, `/feedback` shows `vip_signal`/`public_signal`; after the result, `vip_result`/`public_result`
+- [ ] Bug-group results show as `bug_group_result`
+- [ ] No extra messages in channels or admin per signal; `/feedback export today` CSV contains destination/result/open/close columns
+- [ ] `python test_feedback_main.py` passes

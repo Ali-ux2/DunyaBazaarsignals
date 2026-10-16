@@ -336,7 +336,8 @@ NEWS_FILTER = _env("NEWS_FILTER", default="on").lower() != "off"
 NEWS_BLACKOUT_MIN = int(_env("NEWS_BLACKOUT_MIN", default="15"))
 NEWS_URL = _env("NEWS_URL", default="https://nfs.faireconomy.media/ff_calendar_thisweek.json")
 NEWS_REFRESH_H = 6
-DOUBLE_CONFIRM = _env("DOUBLE_CONFIRM", default="on").lower() != "off"
+DOUBLE_CONFIRM = _env("DOUBLE_CONFIRM", default="on").lower() != "off"          # VIP / public / bug group
+DOUBLE_CONFIRM_SHADOW = _env("DOUBLE_CONFIRM_SHADOW", default="off").lower() == "on"   # shadow channel + paper (unproven) only
 # ---- candle-pattern family P (patterns.py) ----
 PATTERNS_ON = _env("PATTERNS", default="on").lower() != "off"
 P_LIVE_MIN = int(_env("P_LIVE_MIN", default="20"))          # admin-only until ≥20 forward trades at ≥ breakeven

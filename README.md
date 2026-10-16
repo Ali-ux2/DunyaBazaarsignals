@@ -613,3 +613,18 @@ and loss clustering: 30-day `P(loss | previous loss)` vs the overall loss rate, 
 
 ## Double-confirmation effect (silent paper-scoring)
 Every single-confirmation drop (bug, shadow, ensemble, pattern; not fill candidates) is paper-scored on the next candle from already-streamed candles (no extra API requests) and stored as `drop_single_confirmation_result` in the feedback log (pair, direction, entry time, which check failed: momentum/structure/both, payout, result). Never posted to any group or shadow channel. `/confirm2` shows passed vs dropped win rate with n and Wilson LB (today and 7d, split by failed check); `/filters` shows today's line.
+
+## Per-channel double-confirmation split (2026-10-15)
+- **VIP / public / bug group:** DC follows `DOUBLE_CONFIRM` (default on); toggle with `/confirm2 on|off`.
+- **Shadow channel + paper (unproven) signals:** DC follows `DOUBLE_CONFIRM_SHADOW` (default **off**); toggle with `/confirm2 shadow on|off` or the menu button "👻 Shadow DC".
+- Both switches are saved in `STATE_DIR/filters.json` (`dc`, `dc_shadow`) and survive restarts when `/data` is mounted.
+- A bug/pattern signal that fails DC never reaches VIP/public/bug. With shadow DC off it goes to shadow as paper (card, :57, result only); it is tagged `dc=fail` and does **not** count toward the bug/pattern forward proof.
+- The drop is still paper-scored silently (`drop_single_confirmation_result`), so the evidence keeps building. `/confirm2` shows: `VIP/public/bug: ON/OFF · shadow: ON/OFF`, then the DC effect for 1d and 7d. "Passed" counts only results that passed a DC check; shadow DC-off results are shown separately.
+- No extra OTCharts requests. Nothing is reset on upgrade; existing stats, streaks and feedback are kept.
+
+## Feedback log: VIP / public / bug-group results
+Every signal and result sent to VIP or PUBLIC is also written silently to the feedback log (`STATE_DIR/feedback/`, 30 days):
+`vip_signal`, `vip_result`, `public_signal`, `public_result` (legacy single channel: `main_signal`/`main_result`), plus a distinct
+`bug_group_result` for results posted in the bug group. Fields: ts, pair, dir, destination, entry_at, payout, tier, source, pattern,
+dc, hist, level, result (WIN/LOSS/TIE), open, close. Bug signals that also reach VIP/public log with source `bug <key>`.
+Nothing new is sent to any channel or admin; `/feedback` lists the new kinds and `/feedback export` includes them. No extra API requests, routing/stats unchanged.
