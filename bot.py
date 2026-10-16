@@ -2,6 +2,7 @@
 Data: OTCharts REST (/v1/candles polled once per minute after candle close) or CSV replay.
 Telegram: plain Bot API over requests. Logs to stdout."""
 from __future__ import annotations
+import re
 import json, logging, math, os, signal, sys, threading, time
 from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd, requests
@@ -350,7 +351,7 @@ class Bot:
         self.shadow_payout = {}         # pair -> [sum payout, n] for the breakeven comparison
         self.shadow_next = {}           # pair -> datetime (per-pair shadow cooldown)
         self.load_stats(); self.load_shadow(); self.load_channel(); self.load_bench()
-        self.tel = Telemetry(); self._attach_tel(); self.hist = HistGate(); self.hist_day = {'filtered': 0, 'passed': 0}; self.load_hist_mode(); self.tier_sent = []; self.tier_day = {}; self.load_tiers()
+        self.tel = Telemetry(); self._attach_tel(); self.hist = HistGate(); self.hist_day = {'filtered': 0, 'passed': 0}; self.load_hist_mode(); self.load_blocked(); self.tier_sent = []; self.tier_day = {}; self.load_tiers()
         self.dc_day = {}; self._dc_note = {}; self.dc_paper = []; self.fill_pool = []; self.fill_pair_last = {}; self.p_hist_day = {}; self.streaks = Streaks(); self.news = News(); self.blocked_min = []; self._blk = None; self._news_seen = set(); self.load_filters()
         self.load_day()   # after all per-day counters exist
         self.sched = Scheduler(lambda t: self.tg.admin(t), lambda: self.d.now()); self.tg.raw_hook = self.sched_hook; self.tg.cb_hook = self.on_callback; self._bug_first = None
@@ -1058,14 +1059,36 @@ class Bot:
             C.HIST_GATE = j.get("mode", C.HIST_GATE); C.HIST_MIN_COVER_DAYS = float(j.get("days", C.HIST_MIN_COVER_DAYS)); C.BUG_WARMUP = bool(j.get("warmup", C.BUG_WARMUP))
         except Exception: pass
     def warmup_ok(self, why, s, payout, now):
-        """Bug-group warm-up while stored history < HIST_MIN_DAYS: n≥5 in available history, win rate ≥ BE+5pp,
-        7d not clearly negative, ≤4/h. Hard blocks / payout / double-confirm still apply downstream."""
+        """Bug-group warm-up while stored history < HIST_MIN_DAYS: ≥BUG_WARMUP_MIN_DAYS of stored candles, n≥BUG_WARMUP_MIN_N,
+        win rate ≥ BE+5pp, 7d not clearly negative, ≤4/h. The live record check is in bug_fire (never overrides a losing record)."""
         if not (C.BUG_WARMUP and C.BUG_CHANNEL_ID and s and "not enough history" in (why or "")): return False
+        m = re.search(r"\(([\d.]+) days stored", why or "")
+        if not m or float(m.group(1)) < C.BUG_WARMUP_MIN_DAYS: return False
         be = 1 / (1 + payout); n, w = s.get("n30", 0), s.get("w30", 0)
-        if n < C.BUG_WARMUP_MIN_N or w / n < be + C.BUG_WARMUP_MARGIN: return False
+        if n < max(1, C.BUG_WARMUP_MIN_N) or w / n < be + C.BUG_WARMUP_MARGIN: return False
         if s.get("n7", 0) >= 5 and s["w7"] / s["n7"] < be: return False
         self.warmup_sent = [t for t in self.warmup_sent if t > now - timedelta(hours=1)]
         return len(self.warmup_sent) < C.BUG_WARMUP_MAX_HOUR
+    def load_blocked(self):
+        try:
+            with open(os.path.join(C.STATE_DIR, "blocked_setups.json")) as f: C.BLOCKED_SETUPS = [str(x) for x in json.load(f)]
+        except Exception: pass
+    def setup_blocked(self, b):
+        return (b.get("key") or "").lower() in {x.lower() for x in C.BLOCKED_SETUPS}
+    def block_cmd(self, args):
+        if len(args) >= 2 and args[0] in ("add", "remove"):
+            cur = list(C.BLOCKED_SETUPS); low = [x.lower() for x in cur]
+            for k in args[1:]:
+                k = k.strip(",")
+                if not k: continue
+                if args[0] == "add" and k.lower() not in low: cur.append(k); low.append(k.lower())
+                if args[0] == "remove" and k.lower() in low: i = low.index(k.lower()); cur.pop(i); low.pop(i)
+            C.BLOCKED_SETUPS = cur
+            try:
+                with open(os.path.join(C.STATE_DIR, "blocked_setups.json"), "w") as f: json.dump(cur, f)
+            except Exception as e: log.warning("blocked_setups save failed: %s", e)
+        self.tg.admin("⛔ Blocked setups (bug group/VIP/public; still paper in shadow): " + (", ".join(C.BLOCKED_SETUPS) or "none")
+                + "\n/block add P8 · /block remove P8 · /block list")
     def hist_gate(self, pair, keys, now, payout, kind, force=False):
         """kind 'all' (strategies/ensemble/shadow) or 'bugs'. Returns (ok, why, card_line). Off → always ok (force: P patterns, never bypassed)."""
         if force: pass
@@ -1495,7 +1518,7 @@ class Bot:
         self.tg.admin(f"📚 History gate: {C.HIST_GATE.upper()} (all|bugs|off) · need 30d n≥{C.HIST_MIN_N}, Wilson LB ≥ BE+{C.HIST_MARGIN*100:.0f} pts "
                       f"(7d ×{C.HIST_W7}), 7d ≥ BE when n≥5, ≥{C.HIST_MIN_COVER_DAYS:g} days stored\n"
                       f"Today: {self.hist_day['passed']} passed · {self.hist_day['filtered']} filtered · backfill requests {self.hist.req_n}/{C.HIST_BACKFILL_MAX_REQ}\n"
-                      f"Stored candles: {cov}\n🌱 Bug-group warm-up: {'ON' if C.BUG_WARMUP else 'OFF'} (while < {C.HIST_MIN_COVER_DAYS:g}d stored: n≥{C.BUG_WARMUP_MIN_N}, win ≥ BE+{C.BUG_WARMUP_MARGIN*100:.0f}pp, ≤{C.BUG_WARMUP_MAX_HOUR}/h) · /history days N · /history warmup on|off\nThe gate wins over MIN_SIGNALS_PER_HOUR (it is never loosened to hit the hourly target).")
+                      f"Stored candles: {cov}\n🌱 Bug-group warm-up: {'ON' if C.BUG_WARMUP else 'OFF'} (while < {C.HIST_MIN_COVER_DAYS:g}d stored: n≥{C.BUG_WARMUP_MIN_N}, ≥{C.BUG_WARMUP_MIN_DAYS:g}d stored, live not < BE, win ≥ BE+{C.BUG_WARMUP_MARGIN*100:.0f}pp, ≤{C.BUG_WARMUP_MAX_HOUR}/h) · /history days N · /history warmup on|off\nThe gate wins over MIN_SIGNALS_PER_HOUR (it is never loosened to hit the hourly target).")
     def hist_feed(self, pair, df):
         try: self.hist.store.add(pair, df)
         except Exception as e: log.warning("candle store %s: %s", pair, e)
@@ -1659,6 +1682,9 @@ class Bot:
         w, l = b["fw"]; nfw = w + l; be = breakeven(payout); strat = b.get("strategy")
         need = C.P_LIVE_MIN if isP else C.BUG_LIVE_MIN_FW
         unproven = nfw < need or (nfw > 0 and w / nfw < be)   # strategies AND patterns: bug group only after live proof (or warm-up)
+        if sig.get("warmup") and nfw > 0 and w / nfw < be: sig["warmup"] = False   # warm-up never overrides a below-BE live record
+        blocked_setup = self.setup_blocked(b)
+        if blocked_setup: sig["warmup"] = False; unproven = True; sig["blocked_setup"] = True   # blocklist → shadow paper only
         what = f"{b['key']} {b['desc']} — {desc}" if strat else desc
         when = f"ENTER NOW {C.hm(entry)}:{entry.second:02d}" if kind == "now" else f"entry {C.hm(entry)}"
         alert = (f"🐞 BUG SIGNAL {pair} {d} — {when} {C.TZ_LABEL} · {sig['expiry']} min · pattern: {what} (fwd {w}W/{l}L)"
@@ -1672,9 +1698,10 @@ class Bot:
         sig["payout_send"] = pnow
         if sig.get("warmup"): alert += " · 🌱 warm-up (history < %g days; bug group only)" % C.HIST_MIN_COVER_DAYS
         # Bug group: proven live record OR warm-up. Unproven / history-filtered → shadow paper (never bug).
-        can_bug = bool(C.BUG_CHANNEL_ID) and not dc_fail and not blk and not hist_block and (not unproven or sig.get("warmup")) \
+        can_bug = bool(C.BUG_CHANNEL_ID) and not dc_fail and not blk and not hist_block and not blocked_setup \
+                  and (not unproven or (sig.get("warmup") and (nfw == 0 or w / nfw >= be))) \
                   and not self.streaks.frozen("bug", now) and not self.dstop_block("bug", now)
-        can_main = (not dc_fail and not sig.get("warmup") and not unproven and not hist_block and self.bug_route_group(b, k)
+        can_main = (not dc_fail and not blocked_setup and not sig.get("warmup") and not unproven and not hist_block and self.bug_route_group(b, k)
                     and not blk and not self.streaks.frozen("live", now) and not self.dstop_block("live", now))
         main = self.cap_chats(list(self.tg.chats or self.chats_for(self.target))) if can_main else []
         bugch = [("bug", C.BUG_CHANNEL_ID)] if can_bug else []
@@ -1930,6 +1957,7 @@ class Bot:
         ("Stats",    "/patterns", "candle-pattern family P: forward record, status, history rule (/patterns on|off)"),
         ("Stats",    "/confirm2", "double confirmation (momentum + structure): /confirm2 on|off = VIP/public/bug · /confirm2 shadow on|off = shadow/paper"),
         ("Stats",    "/fill",     "Tier-2 fill to MIN_SIGNALS_PER_HOUR: /fill on|off"),
+        ("Stats",    "/block",    "blocked setups (bug/VIP/public; still shadow paper): /block add|remove P8 · /block list"),
         ("Stats",    "/history",  "historical confirmation gate: /history all|bugs|off · coverage, passed/filtered today"),
         ("Stats",    "/best",     "leaderboard of all strategies (A-F, B1-B6, patterns): top 5, bottom 3, sample sizes"),
         ("Stats",    "/telemetry", "admin: data delivery, lag (median/p95), tick heatmap by second, over-extension bins"),
@@ -1959,6 +1987,7 @@ class Bot:
             "/telemetry": self.telemetry_cmd,
             "/best": lambda: self.tg.admin(self.best_text()),
             "/history": lambda: self.history_cmd(self._args),
+            "/block": lambda: self.block_cmd(self._args),
             "/fill": lambda: self.fill_cmd(self._args), "/confirm2": lambda: self.dc_cmd(self._args), "/patterns": lambda: self.patterns_cmd(self._args), "/dailystop": lambda: self.dailystop_cmd(self._args), "/volume": lambda: self.volume_cmd(self._args), "/verbose": lambda: self.verbose_cmd(self._args), "/feedback": lambda: self.feedback_cmd(self._args),
             "/filters": lambda: self.filters_cmd(self._args), "/weekly": lambda: self.weekly_cmd(self._args),
             "/cooldown": lambda: self.cooldown_cmd(self._args), "/blackout": lambda: self.blackout_cmd(self._args), "/news": lambda: self.news_cmd(self._args),

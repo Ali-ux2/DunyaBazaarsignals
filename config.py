@@ -310,7 +310,11 @@ HIST_MIN_N = int(_env("HIST_MIN_N", default="15"))
 HIST_W7 = 2                                                          # 7d occurrences weigh double
 HIST_MIN_COVER_DAYS = float(_env("HIST_MIN_DAYS", "HIST_MIN_COVER_DAYS", default="7"))   # HIST_MIN_DAYS; /history days N
 BUG_WARMUP = _env("BUG_WARMUP", default="on").lower() in ("on", "1", "true", "yes")       # bug group only, while < HIST_MIN_DAYS stored
-BUG_WARMUP_MIN_N = 5; BUG_WARMUP_MARGIN = 0.05; BUG_WARMUP_MAX_HOUR = 4
+BUG_WARMUP_MIN_N = int(_env("BUG_WARMUP_MIN_N", default="15"))          # warm-up needs ≥15 occurrences in stored history
+BUG_WARMUP_MIN_DAYS = float(_env("BUG_WARMUP_MIN_DAYS", default="1"))   # …and ≥1 day of stored candles
+BUG_WARMUP_MARGIN = 0.05; BUG_WARMUP_MAX_HOUR = 4
+# Setups blocked from bug group / VIP / public (still paper-tracked in shadow). /block add|remove|list (persisted in STATE_DIR)
+BLOCKED_SETUPS = [x.strip() for x in _env("BLOCKED_SETUPS", default="P8,P14,P6b").split(",") if x.strip()]
 HIST_KEEP_DAYS = 30
 HIST_BACKFILL_MAX_REQ = int(_env("HIST_BACKFILL_MAX_REQ", default="800"))
 HIST_BACKFILL_LIMIT = int(_env("HIST_BACKFILL_LIMIT", default="10000"))   # bars per backfill call (OTCharts max may be lower)

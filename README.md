@@ -578,13 +578,18 @@ This applies to shadow (relaxed) signals and to paper trades from unproven or ad
 
 ## Bug-group warm-up (`BUG_WARMUP=on`, `HIST_MIN_DAYS=7`)
 While a pair has fewer than `HIST_MIN_DAYS` of stored candles, the history gate would block every bug signal. In warm-up, a bug signal may still post to the **bug group only** when all of these hold:
-- it was seen at least 5 times in the available history;
+- at least `BUG_WARMUP_MIN_DAYS` (default 1) of candles are stored for the pair;
+- it was seen at least `BUG_WARMUP_MIN_N` (default 15) times in the available history;
+- its **live forward record is not below breakeven** (no live trades yet, or live win rate ≥ breakeven at the current payout). Warm-up never overrides a losing live record;
 - its win rate is ≥ breakeven + 5 pp;
 - the 7-day window is not clearly negative (if n7 ≥ 5, the 7-day rate must be ≥ breakeven);
 - at most 4 warm-up posts in the last hour;
 - all hard blocks, the payout floor and double-confirm pass.
 
 The admin mirror line gets a 🌱 warm-up tag (the group card does not). Once the history reaches `HIST_MIN_DAYS`, the normal gate applies automatically. Commands: `/history days N` and `/history warmup on|off` (both persisted).
+
+## Blocked setups (`/block`)
+Setups in `BLOCKED_SETUPS` (env, default `P8,P14,P6b`) never post to the bug group, VIP or public. They are still paper-tracked in the shadow channel so evidence keeps collecting. `/block list`, `/block add P4`, `/block remove P8` (admin; saved in `STATE_DIR/blocked_setups.json`, which overrides the env value after the first change). Stats are not reset.
 
 ## Feedback log (`/feedback`)
 Per-signal feedback that is no longer sent is stored instead, one JSON line per event, in `STATE_DIR/feedback/YYYY-MM-DD.jsonl`. That covers:

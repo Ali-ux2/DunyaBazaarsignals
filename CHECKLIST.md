@@ -39,7 +39,8 @@
 - Pattern backtests: `pattern_backtest_fx.txt` and `pattern_backtest_synthetic.txt`.
 - `frequency_results.txt` holds the first fill-tuning grid. It was produced before the final pacing tweak (slot wait 6→3 and the blocked-minute cap). `ablation_results.txt` reflects the final logic.
 | test_shadow_channel.py | shadow routing, :57 line, summary section, routing line, startup check, unset fallback |
-| test_warmup.py | bug-group warm-up thresholds, 4/h cap, bug-group-only, admin tag, /history days |
+| test_warmup.py | bug-group warm-up thresholds (n≥15, ≥1 day stored), 4/h cap, bug-group-only, admin tag, /history days |
+| test_warmup_fix.py | warm-up never overrides below-BE live record (1W/4L, 1W/6L → shadow), <1 day stored blocked, BLOCKED_SETUPS P8/P14/P6b → shadow only, /block add/remove/list persisted |
 | test_feedback.py | feedback jsonl store, rotation, /feedback, export CSV+JSON, menu, /reset feedback + backup |
 | test_payout_floor.py | NZDUSD 58%/unknown/stale → blocked at candidate + send time, no default payout, refresh while paused, payout in feedback log |
 | test_html.py | all HTML payloads pass a Telegram-like validator; plain-text fallback on 400; bug/shadow channels receive; no per-signal bug/shadow text in admin |
