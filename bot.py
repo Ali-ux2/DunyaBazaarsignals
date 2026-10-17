@@ -28,7 +28,16 @@ import reliability as RL
 from reliability import Reliability
 import quant as Q
 from quant import QuantGuards
-from chanfilters import ChanFilters
+from chanfilters import ChanFilters, score7 as _cf_score7
+def _score7(sig):
+    try: return _cf_score7(sig)
+    except Exception: return None
+def qb_tag(reason):
+    """Short filter tag for a non-chanfilter VIP/public block reason (q_block / correlation)."""
+    r = (reason or "").lower()
+    for key, tag in (("correlation", "correlation"), ("hour ", "hour_seasonality"), ("retired", "pattern_retired"), ("paused", "pattern_paused"), ("atr", "atr")):
+        if key in r: return tag
+    return "other"
 import drawdown as DD
 from drawdown import Drawdown, DDLadder
 import pairguard as PG
@@ -417,7 +426,7 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         self._sq = []; self.shadow_slots = {}; self._shadow_defer = False; self.shadow_capped_day = 0; self.load_shadowcap()   # shadow 1-per-minute cap
         self.load_stats(); self.load_shadow(); self.load_channel(); self.load_bench()
         self.tel = Telemetry(); self._attach_tel(); self.hist = HistGate(); self.hist_day = {'filtered': 0, 'passed': 0}; self.load_hist_mode(); self.load_blocked(); self.tier_sent = []; self.tier_day = {}; self.load_tiers()
-        self.dc_day = {}; self._dc_note = {}; self.dc_paper = []; self.fill_pool = []; self.fill_pair_last = {}; self.p_hist_day = {}; self.streaks = Streaks(); self.news = News(); self.blocked_min = []; self._blk = None; self._news_seen = set(); self.load_filters()
+        self.dc_day = {}; self._dc_note = {}; self.dc_paper = []; self.sil_paper = []; self.fill_pool = []; self.fill_pair_last = {}; self.p_hist_day = {}; self.streaks = Streaks(); self.news = News(); self.blocked_min = []; self._blk = None; self._news_seen = set(); self.load_filters()
         self.load_day()   # after all per-day counters exist
         self.rel_init(); self.q_load(); self.cf_load(); self._q_prom = {"at": 0, "set": set()}
         self.sched = Scheduler(lambda t: self.tg.admin(t), lambda: self.d.now()); self.tg.raw_hook = self.sched_hook; self.tg.cb_hook = self.on_callback; self.tg.start_hook = self.welcome_user; self._bug_first = None
@@ -862,6 +871,8 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
             def _drop():   # over the per-minute cap: silent paper (stats still recorded, nothing posted)
                 t["chan"] = False; t["prechecked"] = True; t["capped"] = True
                 self.fb("shadow_capped", f"{pair} {s['signal']} entry {C.hm(entry)}", source="shadow", pair=pair, dir=s["signal"], confidence=s["confidence"], id=t["id"])
+                self.sil_add("shadow_capped_result", "shadow", pair, s["signal"], entry, payout=s["payout"], reason="shadow cap (lost strongest-per-minute pick)",
+                             id=t["id"], score=s["confidence"], pattern=",".join(s.get("agree", []) or []))
                 self.audit("capped", t, channel="shadow", cap=C.SHADOW_MAX_PER_MIN)
             tw, tl = shadow_tracker.total.get(pair, [0, 0]) if pair in shadow_tracker.total else (0, 0)
             self.shadow_offer(entry, s["confidence"], tw / (tw + tl) if tw + tl else 0, s["payout"], _post, _drop)
@@ -924,7 +935,7 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
                 self.shadow_day.setdefault(t["pair"], [0, 0])[0 if win else 1] += 1
                 ps = self.shadow_payout.setdefault(t["pair"], [0.0, 0]); ps[0] += t["payout"]; ps[1] += 1
             txt = f"👻 Shadow result {t['pair']}: {res} ({t['signal']} {C.hm(t['entry_at'])}, {o:.5f} → {c:.5f})"
-            self.fb("shadow_result", txt, source="shadow", pair=t["pair"], dir=t["signal"], result=res, open=o, close=c, traded=t.get("traded", t["signal"]), dc=t.get("dc", "on"), id=t.get("id", ""), payout=t.get("payout"))
+            self.fb("shadow_result", txt, source="shadow", pair=t["pair"], dir=t["signal"], result=res, open=o, close=c, traded=t.get("traded", t["signal"]), dc=t.get("dc", "on"), id=t.get("id", ""), payout=t.get("payout"), capped=bool(t.get("capped")))
             self.q_outcome(t, res, "shadow")
             self.audit("result", t, channel="shadow" if t.get("chan", True) and C.SHADOW_CHANNEL_ID else "paper", result=res, entry=o, close=c, signal=t["signal"], capped=t.get("capped"))
             if C.SHADOW_CHANNEL_ID and t.get("chan", True):   # public-format result (traded direction, like the group) + chart; stats keep the shadow direction
@@ -1635,6 +1646,80 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
             self.fb("drop_single_confirmation_result", f"{res} ({o:.5f}→{c:.5f}) · failed {g['failed']}", source=g["src"], pair=g["pair"], dir=g["dir"],
                     result=res, failed=g["failed"], payout=g["payout"], entry=g["entry_at"].isoformat(), open=o, close=c, silent=True, paper=True)
         self.dc_paper = keep
+    # ---- silenced (blocked, never posted) paper results: capped shadow, history-filtered, VIP/public filter blocks ----
+    def sil_add(self, kind, src, pair, side, entry, payout=None, reason="", expiry=1, entry_price=None, **extra):
+        """Queue a blocked signal for silent scoring from candles ALREADY polled (no extra API requests). Never posts; never changes routing."""
+        try:
+            if payout is None:
+                try: payout = self.d.payout_info(pair)[0]
+                except Exception: payout = None
+            key = (kind, src, pair, side, entry)
+            if any(g["key"] == key for g in self.sil_paper): return
+            self.sil_paper.append({"key": key, "kind": kind, "src": src, "pair": pair, "dir": side, "entry_at": entry, "expiry": int(expiry or 1),
+                                   "payout": payout, "reason": reason, "entry_price": entry_price, "extra": extra})
+            if len(self.sil_paper) > 1000: self.sil_paper = self.sil_paper[-1000:]
+        except Exception as e: log.warning("silenced add: %s", e)
+    def sil_resolve(self):
+        if not self.sil_paper: return
+        now = self.d.now(); keep = []
+        for g in self.sil_paper:
+            settle = g["entry_at"] + timedelta(minutes=g["expiry"])
+            if now < settle + timedelta(seconds=1): keep.append(g); continue
+            o = c = None
+            if g.get("entry_price") is not None:   # "enter now" bug signals: entry price known, close from stream ticks only
+                try: c = self._tick_price(g["pair"], settle)[0]
+                except Exception: c = None
+                o = g["entry_price"] if c is not None else None
+            else:
+                df = self.cached_candles(g["pair"])
+                if df is not None:
+                    b0 = df.loc[df.index == g["entry_at"]]; b1 = df.loc[df.index == settle - timedelta(minutes=1)]
+                    if not b0.empty and not b1.empty: o, c = float(b0.open.iloc[0]), float(b1.close.iloc[0])
+            if o is None or c is None:
+                if now - settle < timedelta(minutes=C.SHADOW_MAX_WAIT_MIN): keep.append(g); continue
+                res = "UNKNOWN"; txt = "UNKNOWN (pair not polled at that time; no extra request made)"
+            else:
+                res = "TIE" if c == o else ("WIN" if (c > o) == (g["dir"] == "CALL") else "LOSS"); txt = f"{res} ({o:.5f}→{c:.5f}) · {g['reason']}"
+            ex = dict(g["extra"]); ex.setdefault("id", "")
+            self.fb(g["kind"], txt, source=g["src"], pair=g["pair"], dir=g["dir"], result=res, reason=g["reason"], payout=g["payout"],
+                    entry=g["entry_at"].isoformat(), open=o, close=c, expiry=g["expiry"], silent=True, paper=True, **ex)
+        self.sil_paper = keep
+    def silenced_lines(self, days=1):
+        """'Silenced results today' block for /stats (from the feedback log; real payouts; units = flat 1u stake)."""
+        try: recs = FB.read(days, self.d.now())
+        except Exception: recs = []
+        def agg(rs):
+            w = l = t = u = 0; pu = 0.0; pays = []
+            for r in rs:
+                res = r.get("result"); p = r.get("payout")
+                try: p = float(p) if p not in (None, "") else None
+                except (TypeError, ValueError): p = None
+                if res == "WIN": w += 1; pu += p if p is not None else C.DEFAULT_PAYOUT; (pays.append(p) if p is not None else None)
+                elif res == "LOSS": l += 1; pu -= 1; (pays.append(p) if p is not None else None)
+                elif res == "TIE": t += 1
+                else: u += 1
+            return w, l, t, u, pu, (sum(pays) / len(pays) if pays else None)
+        def fmt(lab, rs):
+            w, l, t, u, pu, ap = agg(rs); n = w + l
+            if not (n or t or u): return f"{lab}: none"
+            s_ = f"{lab}: {w}W/{l}L" + (f"/{t}T" if t else "")
+            if n:
+                be = breakeven(ap if ap else C.DEFAULT_PAYOUT); wr = w / n
+                s_ += f" · {wr:.0%} vs BE {be:.1%} {'✅' if wr >= be else '❌'} · net {pu:+.2f}u"
+            return s_ + (f" · {u} unknown" if u else "")
+        k = lambda kind: [r for r in recs if r.get("kind") == kind]
+        vip = k("vip_filtered_result"); out = ["🔇 Silenced results today (paper, never posted):",
+               "  " + fmt("single-confirmation drops", k("drop_single_confirmation_result")),
+               "  " + fmt("capped shadow", k("shadow_capped_result")),
+               "  " + fmt("history-filtered", k("filtered_by_history_result")),
+               "  " + fmt("VIP-filter-blocked", vip)]
+        by = {}
+        for r in vip:
+            fl = r.get("filters") or ["unknown"]
+            if isinstance(fl, str): fl = [x for x in fl.replace(";", ",").split(",") if x.strip()] or ["unknown"]
+            for f in fl: by.setdefault(str(f).strip(), []).append(r)
+        for f, rs in sorted(by.items(), key=lambda kv: -len(kv[1])): out.append("    " + fmt(f, rs))
+        return out
     def dc_stats_line(self, days=1):
         """Passed (scored bug/shadow results) vs dropped (paper-scored single-confirmation drops), from the feedback log."""
         from history import wilson_lb as _lb
@@ -1918,6 +2003,8 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
                 hist_block = True
                 if isP: self.p_hist_day[b["key"]] = self.p_hist_day.get(b["key"], 0) + 1
                 self.drop_note("hist", f"{'pattern' if isP else 'bug'} {b['key']}", f"📚 Filtered by history: 🐞 {pair} {d} {b['key']} · {hwhy}" + (f" · {hline}" if hline else "") + " · paper-tracked")
+                self.sil_add("filtered_by_history_result", f"{'pattern' if isP else 'bug'} {b['key']}", pair, d, entry, payout=payout, reason=hwhy,
+                             id=sig["id"], pattern=b["key"], hist_line=hline, expiry=exp, entry_price=entry_price if kind == "now" else None)
         self.bug_sigs.append(sig)
         if hard: self.audit("blocked", sig, reason="demoted" if b.get("status") == "demoted" else ("paused" if self.manual_pause else "cooldown")); return sig
         w, l = b["fw"]; nfw = w + l; be = breakeven(payout); strat = b.get("strategy")
@@ -1959,7 +2046,11 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         bugch = [("bug", C.BUG_CHANNEL_ID)] if can_bug else []
         if main:
             main, _cfr = self.cf_apply(sig, main, entry)
-            if not main: self.audit("blocked", sig, reason="VIP/public filters: " + ", ".join(k for k, v in _cfr.items() if not v[0]))
+            if not main:
+                self.audit("blocked", sig, reason="VIP/public filters: " + ", ".join(k for k, v in _cfr.items() if not v[0]))
+                self.sil_add("vip_filtered_result", k, pair, d, entry, payout=payout, reason="VIP/public filters: " + "; ".join(f"{k_} ✗ ({v[1]})" for k_, v in _cfr.items() if not v[0]),
+                             id=sig["id"], pattern=k, score7=_score7(sig), tier="bug", filters=[k_ for k_, v in _cfr.items() if not v[0]] or ["unknown"],
+                             expiry=sig.get("expiry", 1), entry_price=sig.get("entry_price") if sig.get("kind") == "now" else None)
         if bugch and self.cf.get("sessions_bug"): bugch, _ = self.cf_apply(sig, bugch, entry)
         if main: main = self.q_corr_take(pair, entry, main)
         if bugch: bugch = self.q_corr_take(pair, entry, bugch)
@@ -1994,6 +2085,8 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
             def _drop():
                 sig["chats"] = []; sig["group"] = False; sig["silent"] = True; sig["capped"] = True
                 self.fb("shadow_capped", f"{pair} {d} {k} entry {C.hm(entry)}", source=k, pair=pair, dir=d, id=sig["id"])
+                self.sil_add("shadow_capped_result", k, pair, d, entry, payout=payout, reason="shadow cap (lost strongest-per-minute pick)",
+                             id=sig["id"], score=sc, pattern=k, expiry=sig.get("expiry", 1))
                 self.audit("capped", sig, channel="shadow", cap=C.SHADOW_MAX_PER_MIN)
             wr = w / nfw if nfw else 0; sc = (wr if nfw >= need else float(b.get("rate", 0) or 0)) * 100
             self.shadow_offer(entry, sc, wr, payout, _post, _drop); return sig
@@ -2072,7 +2165,8 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
                     self.tg.admin(f"🪦 Bug setup {b['key']} ({b['pair']}) RETIRED to shadow: {rr_}."); self.audit("bug_retired", {"pair": b["pair"], "k": g["k"]}, reason=rr_)
             if g.get("votes"): self.strat_record({"strategies": g["votes"]}, o, c)
             self.fb("bug_result", f"{'WIN' if win else 'LOSS'} ({o:.5f}→{c:.5f})", source=g["k"], pair=g["pair"], dir=g["dir"], result="WIN" if win else "LOSS",
-                    silent=g["silent"], paper=bool(g.get("paper")), group=g["group"], dc=g.get("dc", "on"), id=g.get("id", ""))
+                    silent=g["silent"], paper=bool(g.get("paper")), group=g["group"], dc=g.get("dc", "on"), id=g.get("id", ""),
+                    payout=g.get("payout"), entry=str(g.get("entry_at")), open=o, close=c, capped=bool(g.get("capped")))
             self.q_outcome(g, "WIN" if win else "LOSS", ",".join(c[0] for c in g.get("chats", [])) or "paper")
             self.audit("result", g, channel=",".join(c[0] for c in g.get("chats", [])) or "paper", result="WIN" if win else "LOSS", entry=o, close=c, signal=g["dir"],
                        traded_result=(("WIN" if (c > o) == (g["traded"] == "CALL") else "LOSS") if g["group"] else None))
@@ -2531,6 +2625,8 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
                 except Exception: log.exception("shadow resolve failed")
             try: self.dc_paper_resolve()
             except Exception as e: log.warning("dc paper resolve: %s", e)
+            try: self.sil_resolve()
+            except Exception as e: log.warning("silenced paper resolve: %s", e)
             if C.BUG_WATCH:
                 try: self.bug_resolve()
                 except Exception: log.exception("bug resolve failed")
@@ -2585,6 +2681,9 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
             for c_, hwhy, hline in notes[:3]:
                 self.drop_note("hist", "ensemble", f"📚 Filtered by history: {c_['pair']} {c_['signal']} · agreed {','.join(c_.get('agree', []))} · {hwhy}"
                                + (f" · {hline}" if hline else "") + " · paper-tracked")
+                self.sil_add("filtered_by_history_result", "ensemble", c_["pair"], c_["signal"], now.replace(second=0, microsecond=0) + timedelta(minutes=1),
+                             payout=c_.get("payout"), reason=hwhy, id=c_.get("id", ""), pattern="ENS:" + "+".join(sorted(c_.get("agree", []) or [])),
+                             score=c_.get("confidence"), hist_line=hline)
             self.hist_count(False)
             if cands: self.paper_ensemble(cands[0], now)
             return None
@@ -2675,15 +2774,17 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         _qk = "ENS:" + "+".join(sorted(best.get("agree", []) or []))
         try: _qx = compute(best["_df"]) if best.get("_df") is not None else None
         except Exception: _qx = None
-        _qb = self.q_block(best["pair"], [_qk], now, _qx)
+        _qb = self.q_block(best["pair"], [_qk], now, _qx); _qf = None
         if not _qb:
             _free = self.q_corr_take(best["pair"], entry, tg_chats)
             if not _free: _qb = "correlation cap (cluster already signalled this minute)"
             else: tg_chats = _free
         if not _qb:
             tg_chats, _cfr = self.cf_apply(best, tg_chats, entry, best.get("_df"))
-            if not tg_chats: _qb = "VIP/public filters: " + "; ".join(f"{k} ✗ ({v[1]})" for k, v in _cfr.items() if not v[0])
+            if not tg_chats: _qb = "VIP/public filters: " + "; ".join(f"{k} ✗ ({v[1]})" for k, v in _cfr.items() if not v[0]); _qf = [k for k, v in _cfr.items() if not v[0]]
         if _qb:
+            self.sil_add("vip_filtered_result", "ensemble", best["pair"], best["signal"], entry, payout=pnow, reason=_qb, id=self.sid(best, "main"),
+                         pattern=_qk, score=best.get("confidence"), score7=_score7(best), tier=best.get("tier", 1), filters=_qf or [qb_tag(_qb)])
             self.tg.admin(f"🧮 Not sent: {best['pair']} {best['signal']} · {_qb} · paper-tracked")
             self.audit("blocked", best, reason=_qb); self.paper_ensemble(best, now); return
         best["q_key"] = _qk
@@ -2909,6 +3010,8 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         lines += ["  " + l for l in self.tier_lines()]
         lines.append(f"  🔗 Double-confirm {'on' if C.DOUBLE_CONFIRM else 'off'} (shadow {'on' if C.DOUBLE_CONFIRM_SHADOW else 'off'}): {self.dc_day.get('dropped', 0)} single-confirmation dropped of {self.dc_day.get('checked', 0)}")
         lines.append(f"  🧮 Drops today: {self.drops_line()}")
+        try: lines += ["  " + l for l in self.silenced_lines(1)]
+        except Exception as e: log.warning("silenced stats: %s", e)
         lines.append(f"  📚 History gate {C.HIST_GATE}: {self.hist_day['passed']} passed · {self.hist_day['filtered']} filtered by history today")
         lines += ["  🧩 Strategies (today):"] + ["  " + l for l in self.strat_lines(True)]
         if C.SHADOW_RELAXED:
