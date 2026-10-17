@@ -35,7 +35,14 @@ def is_capped(r, ids):
 def posted_only(rows, ids=None):
     """Drop capped (unposted) shadow_result rows; all other rows unchanged. Works on old rows via id matching."""
     ids = capped_ids(rows) if ids is None else ids
-    return [r for r in rows if not (r.get("kind") == "shadow_result" and is_capped(r, ids))]
+    return [r for r in rows if not (r.get("kind") == "shadow_result" and (is_capped(r, ids) or is_lowscore(r)))]
+def is_lowscore(r):
+    v = r.get("lowscore"); return v is True or str(v).lower() == "true"
+def shadow_posted_seq(days=31, now=None):
+    """Posted shadow results (signal direction, as in the export / shadow stats) in entry-time order: [(entry_ts_str, settle_ts_str, result, pair)]."""
+    rows = [r for r in posted_only(read(days, now)) if r.get("kind") == "shadow_result" and r.get("result") in ("WIN", "LOSS", "TIE")]
+    out = [(str(r.get("entry") or r.get("ts")), str(r.get("ts")), r["result"], r.get("pair", "")) for r in rows]
+    return sorted(out)
 def counts(days=1, now=None):
     c = {}
     for r in read(days, now): c[r["kind"]] = c.get(r["kind"], 0) + 1

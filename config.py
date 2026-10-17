@@ -150,6 +150,7 @@ ALLOW_CONFLICT = False   # strict: any opposing vote rejects the setup
 SHADOW_RELAXED = _env("SHADOW_RELAXED", default="1").lower() in ("1", "true", "yes", "on")
 SHADOW_STATS_FILE = os.path.join(STATE_DIR, "shadow_stats.json")
 SHADOW_LOG = os.path.join(STATE_DIR, "shadow_trades.csv")
+SHADOW_MIN_SCORE7 = float(os.environ.get("SHADOW_MIN_SCORE7", "6"))   # shadow channel: 7-vote score below this is silent paper (0 = off)
 SHADOW_MAX_PER_MIN = max(0, int(_env("SHADOW_MAX_PER_MIN", default="1")))   # shadow channel: max cards per entry minute (strongest wins); 0 = unlimited. /shadowcap <n>
 SHADOW_CAP_FILE = os.path.join(STATE_DIR, "shadow_cap.json")
 SHADOW_MAX_WAIT_MIN = 20     # give up resolving a shadow trade if its candle never shows up in already-fetched data

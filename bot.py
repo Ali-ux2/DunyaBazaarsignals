@@ -904,7 +904,13 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
                              id=t["id"], score=s["confidence"], pattern=",".join(s.get("agree", []) or []))
                 self.audit("capped", t, channel="shadow", cap=C.SHADOW_MAX_PER_MIN)
             tw, tl = shadow_tracker.total.get(pair, [0, 0]) if pair in shadow_tracker.total else (0, 0)
-            self.shadow_offer(entry, s["confidence"], tw / (tw + tl) if tw + tl else 0, s["payout"], _post, _drop)
+            sc7 = float(s.get("confidence") or 0) * 7 / 100   # same 7-vote score as the 🎯 Score buckets line
+            if C.SHADOW_MIN_SCORE7 and sc7 < C.SHADOW_MIN_SCORE7:   # low score: silent paper, never posted (no :57 needed)
+                t["chan"] = False; t["prechecked"] = True; t["lowscore"] = True
+                self.sil_add("shadow_lowscore_result", "shadow", pair, s["signal"], entry, payout=s["payout"], reason=f"score {sc7:.2f}/7 < {C.SHADOW_MIN_SCORE7:g}",
+                             id=t["id"], score=s["confidence"], score7=round(sc7, 2), pattern=",".join(s.get("agree", []) or []))
+                self.audit("blocked", t, channel="shadow", reason="low score7")
+            else: self.shadow_offer(entry, s["confidence"], tw / (tw + tl) if tw + tl else 0, s["payout"], _post, _drop)
         self.fb("shadow_signal", f"{pair} {s['signal']} entry {C.hm(entry)}", source="shadow", pair=pair, dir=s["signal"], regime=s["regime"],
                 confidence=s["confidence"], payout=s["payout"], payout_send=pnow, payout_check=pwhy, posted=t["chan"], hist_ok=hok, hist_why=hwhy, hist_line=hline, id=t["id"])
         self.audit("routed", t, channel="shadow" if (C.SHADOW_CHANNEL_ID and pok) else "paper", payout_check=pwhy, hist_ok=hok)
@@ -961,14 +967,15 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
             res = "TIE" if c == o else ("WIN" if (c > o) == (t["signal"] == "CALL") else "LOSS")
             if res != "TIE":
                 win = res == "WIN"; shadow_tracker.record(t["pair"], win)   # internal tracker unchanged (cap tie-break input; not shown)
-                if t.get("capped"):   # never posted: kept out of every shadow figure (scored separately as shadow_capped_result)
+                if t.get("lowscore"): pass   # never posted: scored only as shadow_lowscore_result
+                elif t.get("capped"):   # never posted: kept out of every shadow figure (scored separately as shadow_capped_result)
                     cd = self.shadow_capres_day; cd[0 if win else 1] += 1; cd[2] += (t["payout"] or C.DEFAULT_PAYOUT) if win else -1.0
                 else:
                     self.shadow_day.setdefault(t["pair"], [0, 0])[0 if win else 1] += 1
                     self.shadow_posted.setdefault(t["pair"], [0, 0])[0 if win else 1] += 1
                     ps = self.shadow_payout.setdefault(t["pair"], [0.0, 0]); ps[0] += t["payout"]; ps[1] += 1
             txt = f"👻 Shadow result {t['pair']}: {res} ({t['signal']} {C.hm(t['entry_at'])}, {o:.5f} → {c:.5f})"
-            self.fb("shadow_result", txt, source="shadow", pair=t["pair"], dir=t["signal"], result=res, open=o, close=c, traded=t.get("traded", t["signal"]), dc=t.get("dc", "on"), id=t.get("id", ""), payout=t.get("payout"), capped=bool(t.get("capped")))
+            self.fb("shadow_result", txt, source="shadow", pair=t["pair"], dir=t["signal"], result=res, open=o, close=c, traded=t.get("traded", t["signal"]), dc=t.get("dc", "on"), id=t.get("id", ""), payout=t.get("payout"), capped=bool(t.get("capped")), lowscore=bool(t.get("lowscore")), entry=t["entry_at"].isoformat())
             self.q_outcome(t, res, "shadow")
             self.audit("result", t, channel="shadow" if t.get("chan", True) and C.SHADOW_CHANNEL_ID else "paper", result=res, entry=o, close=c, signal=t["signal"], capped=t.get("capped"))
             if C.SHADOW_CHANNEL_ID and t.get("chan", True):   # public-format result (traded direction, like the group) + chart; stats keep the shadow direction
@@ -980,7 +987,7 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
                     except Exception as e: log.warning("shadow chart: %s", e)
                 if not sent: self.tg.group(cap, chats=sh)
                 SS.record("shadow", rr, now, t["pair"])   # streak = what the shadow channel showed (traded direction)
-            elif not t.get("capped"): self.tg.admin(txt); SS.record("shadow", res, now, t["pair"])
+            elif not (t.get("capped") or t.get("lowscore")): self.tg.admin(txt); SS.record("shadow", res, now, t["pair"])
             self.log_shadow(t, o, c, res)
             try: self.save_shadow()
             except Exception as e: log.warning("shadow save: %s", e)
@@ -1747,6 +1754,7 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         vip = k("vip_filtered_result"); out = ["🔇 Silenced results today (paper, never posted):",
                "  " + fmt("single-confirmation drops", k("drop_single_confirmation_result")),
                "  " + fmt("capped shadow", k("shadow_capped_result")),
+               "  " + fmt("low-score (<" + f"{C.SHADOW_MIN_SCORE7:g}" + ") shadow", k("shadow_lowscore_result")),
                "  " + fmt("history-filtered", k("filtered_by_history_result")),
                "  " + fmt("VIP-filter-blocked", vip)]
         by = {}
@@ -2116,6 +2124,11 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         self.pubcap_posted(main)
         if main: self.fb_main(sig, "signal", bug=True)
         if bugch and self._bug_first != self.day_date: self._bug_first = self.day_date; self.sched.fire("on_bug_signal_first_of_day")
+        if paper and sig.get("score7") is not None and C.SHADOW_MIN_SCORE7 and float(sig["score7"]) < C.SHADOW_MIN_SCORE7:
+            sig["chats"] = []; sig["group"] = False; sig["silent"] = True; sig["lowscore"] = True
+            self.sil_add("shadow_lowscore_result", k, pair, d, entry, payout=payout, reason=f"score {sig['score7']}/7 < {C.SHADOW_MIN_SCORE7:g}", id=sig["id"], pattern=k,
+                         score7=sig["score7"], expiry=sig.get("expiry", 1))
+            return sig
         if paper:   # paper-only (shadow): goes through the per-minute shadow cap
             def _post(): self._bug_card(sig, kind, lab, d, entry)
             def _drop():

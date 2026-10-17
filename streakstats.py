@@ -51,10 +51,23 @@ def compute(seq):
 def stream_stats(rows, stream, now):
     rows = [r for r in rows if r["s"] == stream and r["t"] <= now]
     win = {"today": trading_day_start(now), "7d": now - timedelta(days=7), "30d": now - timedelta(days=30)}
-    out = {k: compute([r["r"] for r in rows if r["t"] >= since]) for k, since in win.items()}
+    out = {k: compute([r["r"] for r in rows if r["t"] >= since]) for k, since in win.items()}   # rows keep given order (shadow: entry order)
     out["all"] = compute([r["r"] for r in rows]); return out
+def shadow_rows(now):
+    """Shadow stream from the feedback log: posted-only shadow_result rows, entry-time order, signal direction (draws ignored later)."""
+    import feedback as FB
+    out = []
+    for e, ts, res, pair in FB.shadow_posted_seq(KEEP_DAYS, now):
+        try: t = datetime.fromisoformat(ts.replace(" ", "T"))
+        except ValueError: continue
+        out.append({"ts": ts, "t": t, "s": "shadow", "r": _norm(res), "pair": pair})
+    return out
 def text(now, rows=None):
     rows = load() if rows is None else rows; tz = now.tzinfo
+    try:   # shadow: rebuilt from posted feedback results (signal direction, entry order); legacy ledger only if the log has none
+        sr = shadow_rows(now)
+        if sr: rows = [r for r in rows if r.get("s") != "shadow"] + sr
+    except Exception: pass
     rows = [dict(r, t=(r["t"] if (r["t"].tzinfo is None) == (tz is None) else (r["t"].replace(tzinfo=None) if tz is None else r["t"].replace(tzinfo=timezone.utc)))) for r in rows]
     L = [f"🔁 Streaks (admin only · draws ignored · trading day from {esc(C.DAILY_STOP_RESUME)} {esc(C.TZ_LABEL)})"]
     for key, lab in STREAMS:
