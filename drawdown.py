@@ -15,7 +15,7 @@ KINDS = {"shadow_result": "shadow", "bug_group_result": "bug", "vip_result": "vi
 
 def trades(days=30, now=None):
     out = {}
-    for r in FB.read(days, now):
+    for r in FB.posted_only(FB.read(days, now)):
         ch = KINDS.get(r.get("kind")); res = str(r.get("result") or "").upper()
         if not ch or res not in ("WIN", "LOSS", "TIE"): continue
         try: pay = float(r.get("payout") or C.DEFAULT_PAYOUT)
@@ -152,8 +152,11 @@ def score_split(now, days=1):
         except ValueError: continue
         if str(r.get("ts", "")) >= cut and r.get("id"): (sig if r.get("type") == "signal" else res)[r["id"]] = r
     out = {}
+    try: capped = FB.capped_ids(FB.read(days + 1, now))   # shadow: posted-only
+    except Exception: capped = set()
     for i, r in res.items():
         s = sig.get(i) or {}
+        if str(i) in capped and s.get("channel") == "shadow": continue
         if s.get("confidence") is None or r.get("result") not in ("WIN", "LOSS"): continue
         sc = float(s["confidence"]) * 7 / 100; d = out.setdefault(s.get("channel", "?"), {"6–7": [0, 0], "<6": [0, 0]})
         d["6–7" if sc >= 6 else "<6"][0 if r["result"] == "WIN" else 1] += 1

@@ -29,7 +29,7 @@ def _ts(r):
 def results(days, now):
     """(channel, pair, local_dt, 'WIN'|'LOSS'|'TIE') rows from the stored feedback log."""
     out, cut = [], now - timedelta(days=days)
-    for r in FB.read(days + 1, now):
+    for r in FB.posted_only(FB.read(days + 1, now)):
         ch = RESULT_KINDS.get(r.get("kind")); res = str(r.get("result") or "").upper()
         if not ch or res not in ("WIN", "LOSS", "TIE"): continue
         t = _ts(r)

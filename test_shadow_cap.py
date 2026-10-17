@@ -45,12 +45,14 @@ b.shadow_eval(df, xx, PAIRS[3], 0.9, 0, T)
 assert not shadow_cards() and b.shadow_open[-1].get("capped")
 
 # 3) capped results: stats recorded, nothing in shadow, no admin spam
-SENT.clear(); ADMIN.clear(); n0 = sum(sum(v) for v in b.shadow_day.values())
+SENT.clear(); ADMIN.clear(); n0 = sum(sum(v) for v in b.shadow_day.values()); c0 = sum(b.shadow_capres_day[:2])
 st = b.shadow_open[0]; b.d.now = lambda: st["settle_at"] + timedelta(seconds=5)
 b.cached_candles = lambda p: df.copy().set_axis(pd.date_range(st["entry_at"] - timedelta(minutes=199), periods=200, freq="1min", tz="UTC"))
 b.d.candles = lambda p, include_forming=False: (b.cached_candles(p), 0, True)
 b.shadow_resolve()
-assert sum(sum(v) for v in b.shadow_day.values()) - n0 >= 3, b.shadow_day
+# posted-only shadow stats: the 1 posted counts in shadow_day, the capped ones only on the 'capped (not sent)' line
+assert sum(sum(v) for v in b.shadow_day.values()) - n0 + sum(b.shadow_capres_day[:2]) - c0 >= 3, (b.shadow_day, b.shadow_capres_day)
+assert sum(sum(v) for v in b.shadow_day.values()) - n0 <= 1 and sum(b.shadow_capres_day[:2]) - c0 >= 2, (b.shadow_day, b.shadow_capres_day)
 assert len([t for ch, t in SENT if ch == "-1004"]) == 1, SENT   # only the posted one's result
 assert not any("Shadow result" in a for a in ADMIN), ADMIN
 b.d.now = lambda: T

@@ -16,7 +16,7 @@ def _pay(r):
 def records(days=30, now=None):
     """{(src, pair): [(ts, win(bool), payout)]} for settled WIN/LOSS."""
     out = {}
-    for r in FB.read(days, now):
+    for r in FB.posted_only(FB.read(days, now)):
         src = LIVE.get(r.get("kind")); res = str(r.get("result") or "").upper()
         if not src or res not in ("WIN", "LOSS") or not r.get("pair"): continue
         out.setdefault((src, str(r["pair"]).upper()), []).append((str(r.get("ts")), res == "WIN", _pay(r)))

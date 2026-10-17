@@ -421,7 +421,9 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         self.warmup_sent = []           # bug-group warm-up posts (rolling hour)
         self.shadow_open = []           # relaxed shadow trades awaiting their result (admin only)
         self.shadow_day = {}            # pair -> [W, L] for today's summary
-        self.shadow_payout = {}         # pair -> [sum payout, n] for the breakeven comparison
+        self.shadow_payout = {}         # pair -> [sum payout, n] for the breakeven comparison (posted only)
+        self.shadow_posted = {}         # pair -> [W, L] all-time, posted to the shadow group only (capped excluded)
+        self.shadow_capres_day = [0, 0, 0.0]   # capped (not sent) today: W, L, net units
         self.shadow_next = {}           # pair -> datetime (per-pair shadow cooldown)
         self._sq = []; self.shadow_slots = {}; self._shadow_defer = False; self.shadow_capped_day = 0; self.load_shadowcap()   # shadow 1-per-minute cap
         self.load_stats(); self.load_shadow(); self.load_channel(); self.load_bench()
@@ -509,11 +511,11 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         done = []
         if scope in ("today", "stats", "all"):
             self.day = {p: [0, 0, 0] for p in self.all_pairs}; self.kind_day = {"confirmed": [0, 0], "switched": [0, 0]}; self.hist_day = {"filtered": 0, "passed": 0}; self.tier_day = {}
-            self.prechecks_day = self.switches_day = self.kept_day = 0; self.ladder = {}; self.strat_day = {}; self.shadow_day = {}
+            self.prechecks_day = self.switches_day = self.kept_day = 0; self.ladder = {}; self.strat_day = {}; self.shadow_day = {}; self.shadow_capres_day = [0, 0, 0.0]
             p = self.pubcap(); p.update(w=0, l=0, n=0, closed=None, start_sent=False); self._pc_save(); self.save_day()
             done.append("today's stats + public-session counters")
         if scope in ("stats", "all"):
-            tracker.reset(); shadow_tracker.reset(); self.shadow_payout = {}; self.strat_total = {}
+            tracker.reset(); shadow_tracker.reset(); self.shadow_payout = {}; self.shadow_posted = {}; self.strat_total = {}
             _an.STRAT_WEIGHTS.clear(); _an.STRAT_MUTED.clear(); self.lb_live = False
             self.tier_total = {"1": [0, 0], "2": [0, 0]}; self.save_tiers()
             self.save_stats(); self.save_strat(); self.save_shadow(); done.append("all W/L, trade counts, strategies, leaderboard")
@@ -789,15 +791,42 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         try:
             with open(C.SHADOW_STATS_FILE) as f: j = json.load(f)
             shadow_tracker.load(j.get("tracker", {})); self.shadow_payout = j.get("payout", {})
-            if j.get("day_date") == str(self.day_date): self.shadow_day = j.get("day", {})
+            if j.get("day_date") == str(self.day_date):
+                self.shadow_day = j.get("day", {}); self.shadow_capres_day = list(j.get("capped_day", [0, 0, 0.0]))
+            if "posted" in j: self.shadow_posted = j["posted"]
+            else: self.shadow_posted_migrate()
             log.info("Loaded shadow stats for %d pairs", len(shadow_tracker.total))
         except FileNotFoundError: pass
         except Exception as e: log.warning("Shadow stats unreadable (%s); starting fresh", e)
+    def shadow_posted_migrate(self):
+        """One-time (first load after deploy): split capped out of stored shadow figures using the feedback log
+        (shadow_capped rows share their id with shadow_result). Stats are corrected, not reset. Older than 30d: can't be split."""
+        try:
+            now = self.d.now(); rows = FB.read(30, now); ids = FB.capped_ids(rows)
+            self.shadow_posted = {p: list(v) for p, v in shadow_tracker.total.items()}
+            today = f"{now:%Y-%m-%d}"; day = {}; cd = [0, 0, 0.0]; n_fix = 0
+            for r in rows:
+                if r.get("kind") != "shadow_result" or r.get("result") not in ("WIN", "LOSS"): continue
+                p = r.get("pair"); win = r["result"] == "WIN"; is_today = str(r.get("ts", ""))[:10] == today
+                try: pay = float(r.get("payout") or C.DEFAULT_PAYOUT)
+                except (TypeError, ValueError): pay = C.DEFAULT_PAYOUT
+                if FB.is_capped(r, ids):
+                    n_fix += 1; v = self.shadow_posted.get(p)
+                    if v: v[0 if win else 1] = max(0, v[0 if win else 1] - 1)
+                    ps = self.shadow_payout.get(p)
+                    if ps and ps[1] > 1: ps[0] -= pay; ps[1] -= 1
+                    if is_today: cd[0 if win else 1] += 1; cd[2] += pay if win else -1.0
+                elif is_today: day.setdefault(p, [0, 0])[0 if win else 1] += 1
+            if self.shadow_day or day: self.shadow_day = day   # today rebuilt posted-only from the log
+            self.shadow_capres_day = cd
+            log.info("shadow posted-only migration: %d capped results excluded", n_fix)
+            self.save_shadow()
+        except Exception as e: log.warning("shadow posted migration: %s", e)
     def save_shadow(self):
         tmp = C.SHADOW_STATS_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"tracker": shadow_tracker.to_json(), "payout": self.shadow_payout,
-                       "day": self.shadow_day, "day_date": str(self.day_date)}, f)
+                       "day": self.shadow_day, "day_date": str(self.day_date), "posted": self.shadow_posted, "capped_day": self.shadow_capres_day}, f)
         os.replace(tmp, C.SHADOW_STATS_FILE)
 
     # ---- shadow cap: at most SHADOW_MAX_PER_MIN shadow-channel cards per entry minute; strongest wins, the rest are silent paper ----
@@ -931,9 +960,13 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
             o, c = float(bar.open.iloc[0]), float(bar.close.iloc[0])
             res = "TIE" if c == o else ("WIN" if (c > o) == (t["signal"] == "CALL") else "LOSS")
             if res != "TIE":
-                win = res == "WIN"; shadow_tracker.record(t["pair"], win)
-                self.shadow_day.setdefault(t["pair"], [0, 0])[0 if win else 1] += 1
-                ps = self.shadow_payout.setdefault(t["pair"], [0.0, 0]); ps[0] += t["payout"]; ps[1] += 1
+                win = res == "WIN"; shadow_tracker.record(t["pair"], win)   # internal tracker unchanged (cap tie-break input; not shown)
+                if t.get("capped"):   # never posted: kept out of every shadow figure (scored separately as shadow_capped_result)
+                    cd = self.shadow_capres_day; cd[0 if win else 1] += 1; cd[2] += (t["payout"] or C.DEFAULT_PAYOUT) if win else -1.0
+                else:
+                    self.shadow_day.setdefault(t["pair"], [0, 0])[0 if win else 1] += 1
+                    self.shadow_posted.setdefault(t["pair"], [0, 0])[0 if win else 1] += 1
+                    ps = self.shadow_payout.setdefault(t["pair"], [0.0, 0]); ps[0] += t["payout"]; ps[1] += 1
             txt = f"👻 Shadow result {t['pair']}: {res} ({t['signal']} {C.hm(t['entry_at'])}, {o:.5f} → {c:.5f})"
             self.fb("shadow_result", txt, source="shadow", pair=t["pair"], dir=t["signal"], result=res, open=o, close=c, traded=t.get("traded", t["signal"]), dc=t.get("dc", "on"), id=t.get("id", ""), payout=t.get("payout"), capped=bool(t.get("capped")))
             self.q_outcome(t, res, "shadow")
@@ -963,16 +996,19 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
 
     def shadow_lines(self, day_only=False):
         rows, tw, tl, ps, pn = [], 0, 0, 0.0, 0
-        pairs = sorted(set(self.shadow_day) if day_only else set(shadow_tracker.total))
-        for p in pairs:
-            w, l = (self.shadow_day.get(p, [0, 0]) if day_only else shadow_tracker.total[p])
+        src = self.shadow_day if day_only else self.shadow_posted
+        for p in sorted(src):
+            w, l = src.get(p, [0, 0])
             if not (w or l): continue
             s_, n_ = self.shadow_payout.get(p, [C.DEFAULT_PAYOUT, 1]); pay = s_/n_ if n_ else C.DEFAULT_PAYOUT
             be = breakeven(pay); wr = w/(w+l); tw += w; tl += l; ps += pay*(w+l); pn += w+l
             rows.append(f"  {p}: {w}W/{l}L · {wr:.0%} vs BE {be:.1%} {'✅' if wr > be else '❌'}")
-        if not rows: return ["  no resolved shadow trades yet"]
+        cw, cl, cu = self.shadow_capres_day
+        cap = [f"  capped (not sent): {cw}W/{cl}L" + (f" · {cw/(cw+cl):.0%} · net {cu:+.2f}u" if cw + cl else "")] if day_only and (cw or cl) else []
+        if not rows: return ["  no resolved shadow trades yet"] + cap
         be = breakeven(ps/pn); wr = tw/(tw+tl)
         rows.append(f"  Total {tw}W/{tl}L · {wr:.0%} vs BE {be:.1%} {'✅ above' if wr > be else '❌ below'} breakeven")
+        rows += cap
         return rows
 
     def shadow_report(self):
@@ -3086,7 +3122,7 @@ class Bot(AdminJobs, Onboarding, Reliability, QuantGuards, ChanFilters, Drawdown
         except Exception as e: log.warning("bug review: %s", e)
         try: self.week_record()
         except Exception as e: log.warning("week record: %s", e)
-        self.shadow_day = {}; self.strat_day = {}; self.save_strat()
+        self.shadow_day = {}; self.shadow_capres_day = [0, 0, 0.0]; self.strat_day = {}; self.save_strat()
         try: SS.prune(self.d.now())
         except Exception as e: log.warning("streak prune: %s", e)
         self.day = {p: [0, 0, 0] for p in self.all_pairs}; self.day_date = today

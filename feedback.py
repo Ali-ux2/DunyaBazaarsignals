@@ -25,6 +25,17 @@ def read(days=1, now=None):
                 try: out.append(json.loads(line))
                 except ValueError: pass
     return out
+def capped_ids(rows):
+    """Ids of shadow signals that lost the one-per-minute pick (never posted): from shadow_capped / shadow_capped_result rows."""
+    return {str(r.get("id")) for r in rows if r.get("kind") in ("shadow_capped", "shadow_capped_result") and r.get("id")}
+def is_capped(r, ids):
+    c = r.get("capped")
+    if c is True or str(c).lower() == "true": return True
+    return bool(r.get("id")) and str(r.get("id")) in ids
+def posted_only(rows, ids=None):
+    """Drop capped (unposted) shadow_result rows; all other rows unchanged. Works on old rows via id matching."""
+    ids = capped_ids(rows) if ids is None else ids
+    return [r for r in rows if not (r.get("kind") == "shadow_result" and is_capped(r, ids))]
 def counts(days=1, now=None):
     c = {}
     for r in read(days, now): c[r["kind"]] = c.get(r["kind"], 0) + 1
